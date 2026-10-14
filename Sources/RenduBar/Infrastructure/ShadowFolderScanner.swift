@@ -1,87 +1,5 @@
-import CryptoKit
-import Darwin
 import Foundation
-
-private enum CollectorProcess {
-    private static let lock = NSLock()
-    private static var running: [UUID: Process] = [:]
-    private static var cancelled = Set<UUID>()
-
-    static func cancel(_ token: UUID) {
-        lock.lock(); cancelled.insert(token); let process=running[token]; lock.unlock()
-        if let process, process.isRunning { process.terminate() }
-    }
-    static func asyncRun(arguments: [String], timeout: TimeInterval) async -> Data? {
-        let token=UUID()
-        return await withTaskCancellationHandler(operation: {
-            await Task.detached(priority:.utility) { run(arguments:arguments,timeout:timeout,token:token) }.value
-        }, onCancel: { cancel(token) })
-    }
-
-    static func cancelAll() {
-        lock.lock()
-        let processes = Array(running.values)
-        lock.unlock()
-        for process in processes where process.isRunning { process.terminate() }
-        let deadline = Date().addingTimeInterval(5)
-        while processes.contains(where: { $0.isRunning }) && Date() < deadline {
-            usleep(100_000)
-        }
-        for process in processes where process.isRunning { kill(process.processIdentifier, SIGKILL) }
-    }
-
-    static func run(arguments: [String], timeout: TimeInterval, token: UUID) -> Data? {
-        lock.lock(); let alreadyCancelled=cancelled.remove(token) != nil; lock.unlock()
-        guard !alreadyCancelled else { return nil }
-        defer { lock.lock(); cancelled.remove(token); lock.unlock() }
-        let script = Bundle.main.url(forResource: "shadow_collector", withExtension: "py")
-            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("shadow_collector.py")
-        guard FileManager.default.fileExists(atPath: script.path) else { return nil }
-        let python = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/python3")
-            ? "/opt/homebrew/bin/python3" : "/usr/bin/python3"
-        let temporary = FileManager.default.temporaryDirectory
-            .appendingPathComponent("rendubar-collector-" + UUID().uuidString, isDirectory: true)
-        guard (try? FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)) != nil else { return nil }
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        let stdout = temporary.appendingPathComponent("stdout")
-        let stderr = temporary.appendingPathComponent("stderr")
-        guard FileManager.default.createFile(atPath: stdout.path, contents: nil),
-              FileManager.default.createFile(atPath: stderr.path, contents: nil),
-              let outHandle = try? FileHandle(forWritingTo: stdout),
-              let errHandle = try? FileHandle(forWritingTo: stderr) else { return nil }
-        defer { try? outHandle.close(); try? errHandle.close() }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = [script.path] + arguments
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = outHandle
-        process.standardError = errHandle
-        let done = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in done.signal() }
-        do { try process.run() } catch { return nil }
-        lock.lock()
-        running[token] = process
-        let cancelAfterLaunch=cancelled.contains(token)
-        lock.unlock()
-        if cancelAfterLaunch && process.isRunning { process.terminate() }
-        defer {
-            lock.lock()
-            running.removeValue(forKey: token)
-            cancelled.remove(token)
-            lock.unlock()
-        }
-        if done.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            if done.wait(timeout: .now() + 3) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
-                _ = done.wait(timeout: .now() + 2)
-            }
-        }
-        guard !process.isRunning, process.terminationStatus == 0 else { return nil }
-        try? outHandle.synchronize()
-        return try? Data(contentsOf: stdout)
-    }
-}
+import CryptoKit
 
 @MainActor
 final class ShadowFolderScanner {
@@ -91,6 +9,9 @@ final class ShadowFolderScanner {
         let seenAt: Date
     }
 
+    private var shutdownTask: Task<Void,Never>?
+    private let fixtureHelperURL:URL?
+    init(fixtureHelperURL:URL? = nil) { self.fixtureHelperURL=fixtureHelperURL }
     private var stamps: [String: Stamp] = [:]
     private var lastGood: [RenderEntry] = []
     private(set) var health = SourceHealth()
@@ -110,7 +31,7 @@ final class ShadowFolderScanner {
         guard let rootsData = try? JSONSerialization.data(withJSONObject: roots),
               let rootsJSON = String(data: rootsData, encoding: .utf8) else { return lastGood }
         lastGood = lastGood.filter { e in e.path.map { path in roots.contains { RenderOrganization.isInside(path, root: $0) } } ?? false }
-        let data = await CollectorProcess.asyncRun(arguments:["scan","--roots-json",rootsJSON],timeout:25)
+        let data = await CollectorProcess.asyncRun(arguments:["scan","--roots-json",rootsJSON],timeout:25,fixtureHelperURL:fixtureHelperURL)
         guard !Task.isCancelled else { return lastGood }
         return ingest(data, roots: roots)
     }
@@ -179,7 +100,7 @@ final class ShadowFolderScanner {
 
     func history(_ roots: [String]) async -> RemoteHistoryResult? {
         guard let encoded = try? JSONSerialization.data(withJSONObject:roots), let json = String(data:encoded,encoding:.utf8) else { return nil }
-        let data = await CollectorProcess.asyncRun(arguments:["history","--roots-json",json],timeout:25)
+        let data = await CollectorProcess.asyncRun(arguments:["history","--roots-json",json],timeout:25,fixtureHelperURL:fixtureHelperURL)
         guard !Task.isCancelled, let data, let object = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
               object["ok"] as? Bool == true, let files = object["files"] as? [[String:Any]] else { return nil }
         var entries:[RenderEntry] = []; var seen=Set<String>()
@@ -201,7 +122,7 @@ final class ShadowFolderScanner {
         let hash = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
         let destination = RenduStorage.root.appendingPathComponent("Previews/" + hash + ".jpg")
         let args = ["preview", "--roots-json", rootsJSON, "--path", path, "--output", destination.path]
-        let result = await CollectorProcess.asyncRun(arguments:args,timeout:38)
+        let result = await CollectorProcess.asyncRun(arguments:args,timeout:38,fixtureHelperURL:fixtureHelperURL)
         guard !Task.isCancelled else { return nil }
         guard let result,
               let object = try? JSONSerialization.jsonObject(with: result) as? [String: Any],
@@ -209,7 +130,11 @@ final class ShadowFolderScanner {
         return try? Data(contentsOf: destination)
     }
 
-    func cancel() { CollectorProcess.cancelAll() }
+    func cancel() {
+        CollectorProcess.requestCancelAll()
+        shutdownTask=Task.detached(priority:.utility) { CollectorProcess.waitForExit() }
+    }
+    func waitForShutdown() async { await shutdownTask?.value }
 
     nonisolated static func parseUTC(_ value: String) -> Date? {
         RenderDate.parseOptional(value)

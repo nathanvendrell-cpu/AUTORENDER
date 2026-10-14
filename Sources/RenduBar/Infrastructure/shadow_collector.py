@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 
 CONNECTION_FILE = Path.home() / "Library" / "Application Support" / "RenduBar" / "connection.json"
@@ -55,18 +56,77 @@ def interrupt(signum: int, _frame: object) -> None:
     raise KeyboardInterrupt(f"signal {signum}")
 
 
-def run(argv: list[str], seconds: int) -> bytes:
+class CollectorCommandError(RuntimeError):
+    """Retain bounded command status, never argv/raw remote stdout/stderr."""
+    def __init__(self, command: str, exit_code: int | None, stderr: bytes = b"", timed_out: bool = False, elapsed_seconds: float | None = None):
+        text = stderr[:32768].decode("utf-8", "replace").lower()
+        phase = "command_timeout" if timed_out else "command_execution"
+        reason = "timeout" if timed_out else "nonzero_exit"
+        if command == "ssh":
+            phase = "ssh_timeout" if timed_out else ("ssh_transport" if exit_code == 255 else "remote_command")
+            patterns = [
+                ("could not resolve hostname", "hostname_resolution"),
+                ("connection refused", "connection_refused"),
+                ("network is unreachable", "network_unreachable"),
+                ("no route to host", "network_unreachable"),
+                ("permission denied", "authentication_failed"),
+                ("host key verification failed", "host_key_verification"),
+                ("remote host identification has changed", "host_key_changed"),
+                ("load key", "identity_key_unreadable"),
+                ("the command line is too long", "command_line_too_long"),
+                ("connection timed out", "connection_timeout"),
+            ]
+            for pattern, value in patterns:
+                if pattern in text:
+                    reason = value
+                    break
+            if not timed_out and exit_code != 255:
+                if any(value in text for value in ["parsererror", "parseexception", "unexpected token", "missing closing"]):
+                    phase, reason = "remote_powershell_parse", "powershell_parse_error"
+                elif "itemnotfoundexception" in text or "cannot find path" in text:
+                    phase, reason = "remote_source_read", "source_path_unavailable"
+        self.diagnostic = {"phase": phase, "reason": reason, "exitCode": exit_code, "timedOut": timed_out, "elapsedSeconds": round(elapsed_seconds,3) if elapsed_seconds is not None else None}
+        super().__init__(reason)
+
+
+def observation_failure(exc: BaseException, elapsed_seconds: float | None = None) -> dict[str, object]:
+    diagnostic: dict[str, object] = {"phase": "local_helper", "reason": "unclassified_exception"}
+    if isinstance(exc, CollectorCommandError):
+        diagnostic = exc.diagnostic
+    elif isinstance(exc, KeyboardInterrupt):
+        diagnostic = {"phase": "cancelled", "reason": "request_cancelled"}
+    elif type(exc).__name__ == "ContractError":
+        diagnostic = {"phase": "observation_contract", "reason": "contract_rejected"}
+    elif isinstance(exc, json.JSONDecodeError):
+        diagnostic = {"phase": "snapshot_json", "reason": "invalid_json"}
+    elif isinstance(exc, RuntimeError):
+        connections = {
+            "Shadow connection not configured": "connection_not_configured",
+            "invalid Shadow host": "invalid_host_configuration",
+            "invalid Shadow user": "invalid_user_configuration",
+            "invalid Shadow identity path": "invalid_identity_configuration",
+            "Shadow SSH identity unavailable": "identity_key_unavailable",
+        }
+        if str(exc) in connections:
+            diagnostic = {"phase": "local_connection", "reason": connections[str(exc)]}
+    if diagnostic.get("elapsedSeconds") is None:
+        diagnostic["elapsedSeconds"] = round(elapsed_seconds,3) if elapsed_seconds is not None else None
+    return {"ok": False, "error": type(exc).__name__, "diagnostic": diagnostic}
+
+
+def run(argv: list[str], seconds: int, input_bytes: bytes | None = None) -> bytes:
     global ACTIVE
-    ACTIVE = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    command_start = time.monotonic()
+    ACTIVE = subprocess.Popen(argv, stdin=subprocess.PIPE if input_bytes is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               start_new_session=True)
     try:
-        out, err = ACTIVE.communicate(timeout=seconds)
+        out, err = ACTIVE.communicate(input=input_bytes, timeout=seconds)
         if ACTIVE.returncode:
-            raise RuntimeError(f"exit {ACTIVE.returncode}: {err.decode('utf-8', 'replace')[:300]}")
+            raise CollectorCommandError(Path(argv[0]).name, ACTIVE.returncode, err, elapsed_seconds=time.monotonic()-command_start)
         return out
     except subprocess.TimeoutExpired as exc:
         stop_active()
-        raise RuntimeError(f"timeout after {seconds}s") from exc
+        raise CollectorCommandError(Path(argv[0]).name, None, timed_out=True, elapsed_seconds=time.monotonic()-command_start) from exc
     finally:
         if ACTIVE is not None and ACTIVE.poll() is None:
             stop_active()
@@ -172,23 +232,28 @@ def preview(path: str, roots: list[str], output: Path) -> dict[str, object]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["scan", "preview", "history"])
+    parser.add_argument("mode", choices=["scan", "preview", "history", "observe"])
     parser.add_argument("--roots-json", required=True)
+    parser.add_argument("--sources-json", default="[]")
     parser.add_argument("--path")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     roots = json.loads(args.roots_json)
     if not isinstance(roots, list) or not all(isinstance(value, str) for value in roots):
         parser.error("roots must be string array")
+    observation_start = time.monotonic()
     try:
-        if args.mode in ("scan", "history"):
+        if args.mode == "observe":
+            from shadow_run_observer import observe
+            result = observe(json.loads(args.sources_json),connection,ssh_base,run)
+        elif args.mode in ("scan", "history"):
             result = scan(roots, history=args.mode == "history")
         else:
             if not args.path or args.output is None:
                 parser.error("preview requires path and output")
             result = preview(args.path, roots, args.output)
     except BaseException as exc:
-        result = {"ok": False, "error": str(exc)[:300]}
+        result = observation_failure(exc, elapsed_seconds=time.monotonic()-observation_start) if args.mode == "observe" else {"ok": False, "error": str(exc)[:300]}
     finally:
         stop_active()
     print(json.dumps(result, ensure_ascii=False), flush=True)

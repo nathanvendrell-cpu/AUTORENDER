@@ -1,0 +1,47 @@
+{
+  "title": "Neutral completed run",
+  "id": "shadow:run:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "runID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "scopeID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sourceID": "neutral",
+  "provenance": "source_declared",
+  "observedAt": "2026-10-14T00:00:00Z",
+  "launcherHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "scriptHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "postScriptHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "outputRoot": "C:\\neutral",
+  "rawRoot": "C:\\neutral\\raw",
+  "postRoot": "C:\\neutral\\post",
+  "total": 6,
+  "rawCount": 6,
+  "postCount": 6,
+  "plans": {
+    "A": [
+      1,
+      3
+    ],
+    "B": [
+      4,
+      6
+    ]
+  },
+  "planCounts": {
+    "A": {
+      "raw": 3,
+      "post": 3
+    },
+    "B": {
+      "raw": 3,
+      "post": 3
+    }
+  },
+  "missingRaw": [],
+  "missingPost": [],
+  "frames": [],
+  "claims": [],
+  "activity": "countsReached",
+  "phases": [],
+  "processCoverage": true,
+  "diagnostics": [],
+  "logs": {}
+}

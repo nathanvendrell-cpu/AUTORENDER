@@ -1,70 +1,72 @@
 # AUTORENDER
 
-Application macOS native pour retrouver et suivre les rendus des sources Mac et Shadow configurées. AUTORENDER relève leurs données en lecture seule : il ne lance ni n’arrête les moteurs de rendu.
+AUTORENDER 0.7.0 est un moniteur macOS natif des rendus Mac et Shadow supportés. Il relève les sources en lecture seule et ne lance ni n’arrête les moteurs de rendu. Le statut du snapshot figure dans [VALIDATION.md](VALIDATION.md).
 
-## Suivi compact et dashboard
+## En cours et historique
 
-Le suivi compact affiche automatiquement tous les jobs connus du catalogue, sans choisir un projet au préalable et sans limite cachée sur le nombre de jobs. Ses lignes compactes et scrollables sont groupées par projet et travail. Chaque version garde ses propres compteurs, état daté et temps restant estimé lorsqu’il est calculable. Les filtres Tous, Direct et Historique ainsi que la recherche sont facultatifs. La barre des menus indique le nombre de jobs actifs ; aucun pourcentage global ne mélange plusieurs travaux ou versions.
+Le dashboard et le suivi compact s’ouvrent sur **En cours** : uniquement les tâches récentes, qualifiées et encore détectées. Un ancien état `.running`, un PID candidat ou un compteur JSON ne suffit pas à y entrer. Les observations non qualifiées ou inactives restent dans Sources.
 
-Le dashboard organise Projet → Travail → Version. Un seul détail est déployé, avec au plus deux derniers aperçus. La sélection de version est mémorisée par travail et partagée avec le suivi compact. Le bouton « Suivi compact » et le menu de l’application donnent accès à la petite fenêtre ; elle peut aussi être détachée du popover. Les fenêtres se déplacent, se redimensionnent, se réduisent et se rouvrent, avec géométrie mémorisée.
+Une tâche liée à un contrat producteur supporté et à une identité revalidée peut être visible avant son premier PNG ou JSON. Son compteur reste non mesuré, jamais zéro par défaut. Une longue frame ne la fait pas disparaître entre deux sorties. Un périmètre partagé ou incomplet empêche l’attribution du compteur, pas la visibilité de la tâche qualifiée. Cette qualification ne mesure ni GPU ni progression récente.
 
-« Organiser » permet de rattacher un job à un travail existant ou à un nouveau travail nommé et de donner un libellé à sa version. Ces choix sont des métadonnées locales : les fichiers et les identifiants source restent intacts. Les identités explicitement fournies par la source sont prioritaires. Sans identité de travail fiable, chaque job reste distinct ; noms et extensions ne provoquent aucune fusion automatique. Les filtres de type de travail utilisent une déclaration source ou utilisateur, séparément du format des fichiers : les PNG d’un travail vidéo ne deviennent pas des travaux Images indépendants.
+**Terminés** et **Archives** sont des sections distinctes. La fin technique d’une séquence native exige le plan complet et les sorties stables vérifiées sur deux observations ; un compteur déclaré complet seul ne suffit pas. Après disparition validée du processus, le collecteur existant réconcilie de façon bornée le dernier périmètre qualifié, sans réassocier un PID ni lancer de nouveau poller. L’historique garde les identités et états datés, pas un faux actif actuel.
 
-## Compteurs, activité et estimation
+Un terminal Shadow antérieurement qualifié par un DTO valide et complet reste dans Terminés lorsque sa source devient indisponible : il est historique, non frais et non actif. Un état inconnu, une couverture partielle, des workers attribués ou des sorties manquantes ne sont pas promus depuis les seuls compteurs. Un actif frais qualifié de même identité remplace l’état terminal antérieur. La nouvelle action Archiver reste désactivée sur un terminal historique ; les préférences d’archives existantes restent distinctes.
 
-Une progression exige un numérateur et un dénominateur valides de la même version et de la même étape. Les restants valent total moins compteur. Sans total, avec un compteur incohérent ou une mesure périmée, l’état est qualifié ou indéterminé. Les images comptées d’une séquence ne sont pas des exports vidéo finaux. Les étapes Shadow brutes et post restent distinctes ; leur total doit être déclaré et relié au même périmètre, jamais déduit de l’un des compteurs ou codé en dur. Le total peut provenir de l’API ou d’une déclaration validée de la page du moniteur, avec provenance et date.
+Une ligne terminée peut être archivée ou masquée de la liste compacte. Un actif qualifié ne peut pas être masqué. **Options → Réafficher les rendus masqués** restaure le masque d’affichage, indépendamment de la restauration des archives. Ces préférences ne suppriment ni rendus ni catalogue.
 
-Une source récente ne prouve pas qu’un rendu est actif. Une tâche Ready indique prêt/planifié, pas un processus actif ; un nombre de processus global ne suffit pas à attribuer une activité à chacun des jobs. Une mesure conservée hors ligne reste datée. Les compteurs d’état sont présentés séparément, sans les convertir en pourcentage de livraison.
+## Compteurs et fichiers
 
-La cadence et l’intervalle médian entre sorties sont historiques et issus d’un échantillon borné ; ils ne certifient pas la durée de calcul moteur d’une image. Le temps restant et l’ETA courante ne sont estimés que si activité réelle, fraîcheur, total et cadence récente sont disponibles. À l’arrêt, en pause, hors ligne ou sans données suffisantes, ils restent indéterminés. L’animation des jauges est courte, liée uniquement aux changements mesurés de progression, et figée lorsque le job n’est pas actif ou récent.
+La progression utilise un numérateur et un dénominateur cohérents de la même version et de la même étape. Brut et post Shadow restent séparés. Sans mesure attribuable, aucune jauge n’invente un pourcentage. Nom et date de la dernière sortie sont distincts du compteur.
 
-RAM, GPU, plans et réglages n’apparaissent que lorsqu’ils sont fournis par la source. Un compteur complet, un fichier stable ou un aperçu lisible ne constitue pas une certification d’achèvement ou de livraison.
+Le raccord natif analyse une grammaire Python statique supportée sans exécuter le producteur ni la scène. Il vérifie identité, arguments courants, empreinte du script et plan. L’enveloppe PNG cohérente et les empreintes stables sur deux observations ne certifient ni décodage intégral, provenance historique, export vidéo final ni qualité artistique.
 
-## Catalogue, aperçu et historique
+Le catalogue organise Projet → Travail → Version sans fusion par titre ou extension. Les identités source sont prioritaires ; « Organiser » ajoute des métadonnées locales explicites. Type de travail et format de fichier restent distincts : un travail vidéo peut produire des PNG.
 
-Le catalogue local conserve les jobs déjà connus. Un job disparu d’un relevé demeure retrouvable avec son dernier état daté ; il ne compte pas comme actif actuel. Cela ne prouve pas un nouveau lancement lorsque son compteur baisse, ni l’existence de tous les fichiers anciens.
+Le détail demande au plus deux aperçus avec états En attente, Chargement, Échec et Disponible. Les dossiers/fichiers locaux vérifiés peuvent être ouverts ou révélés ; un chemin Shadow non monté reste distant. Scans et historique paginé sont bornés, et le nombre inventorié n’est pas un total de rendu. Cadences et estimations sont historiques ; GPU, RAM et réglages ne sont pas inventés depuis un processus global.
 
-Les relevés courants de fichiers sont bornés : jusqu’à 80 exports Mac récents, et sur Shadow jusqu’à 24 par dossier et 80 combinés. Ces limites de fichiers ne limitent pas le nombre de jobs du catalogue et ne sont jamais utilisées comme total de progression.
+Dans la recette finale, les deux aperçus historiques restent En attente parce que les entrées sont non stables et la source Shadow indisponible. L’image décodée et la récupération de cache ne sont pas validées sur ce binaire ; aucun état de fichier n’a été forcé pour contourner cette garde.
 
-L’historique s’ouvre explicitement pour la version sélectionnée et se charge par pages de 40 métadonnées. La couverture complète, partielle ou périmée est indiquée. Le nombre inventorié décrit les fichiers connus dans ce périmètre, pas le total du rendu. Un curseur invalidé par un changement de périmètre ou de configuration demande une actualisation. Les fichiers jamais observés puis supprimés ne peuvent pas être reconstruits.
+## Configuration
 
-Les lignes du suivi compact ne chargent aucune image. Seul le détail demande ses deux aperçus visibles, via une file annulable et un cache mémoire borné. « À vérifier » indique une première observation ou un fichier changeant ; « Stable » indique taille/date inchangées pendant le contrôle ; « Lisible » indique un aperçu décodé. Une longue interruption d’écriture ou un remplacement conservant taille/date restent des limites de cette détection.
+Sources suivies contient les dossiers locaux et connexions Shadow déjà autorisées. La découverte est bornée aux contrats supportés, sans exploration universelle. Un worker Shadow nécessite une attribution qualifiée ; une couverture partielle ne prouve pas l’absence d’autres workers.
 
-## Retrouver les fichiers
+Le support applicatif conserve le nom `RenduBar`. Configuration, préférences, catalogue, caches, registres et clés SSH restent privés. L’API locale compatible est externe et n’est pas démarrée par AUTORENDER. Quitter le moniteur ne ferme pas les moteurs indépendants.
 
-Un nom ou un bouton dossier ouvre directement le dossier local lié lorsqu’une cible unique est vérifiée. Plusieurs versions ou étapes proposent un menu de cibles exactes ; aucun ancêtre commun n’est deviné. L’accès au détail est séparé de l’ouverture du dossier.
+## Construire
 
-Le dernier fichier local connu et stable peut être révélé et sélectionné dans Finder. Il s’agit du fichier réel du périmètre, pas d’un cache de vignette ou d’une URL d’aperçu. Il n’est pas lancé automatiquement, notamment pour l’audio et la vidéo.
-
-Un chemin Shadow non monté est marqué distant et peut être copié. Un miroir local doit être explicitement configuré et vérifié ; AUTORENDER ne monte pas de partage ni ne crée de connexion automatiquement. Une vérification de chemin reste datée et n’empêche pas un fichier d’avoir été déplacé depuis.
-
-## Configuration locale
-
-Ajouter les dossiers Mac et les chemins absolus Shadow dans « Sources suivies ». Le type de travail d’un dossier peut être déclaré ou laissé non défini. L’application suit uniquement ces dossiers et les sources configurées ; elle ne découvre pas tous les rendus de toutes les applications et ne balaie pas tout le Mac ou Shadow.
-
-Pour compatibilité, le support applicatif reste nommé `RenduBar`. Configuration, catalogue privé `Catalog/jobs.json`, derniers relevés et aperçus restent locaux. Les champs optionnels permettent la migration des anciennes configurations. Une sauvegarde ciblée précède la première modification d’organisation ; une erreur d’enregistrement est signalée.
-
-Le fichier optionnel `monitor-jobs.json` décrit une liste de jobs Mac avec `id` et `dossier`. Les dossiers existants sont importés et les dossiers retirés ne sont pas réimportés automatiquement. `connection.json` contient `host`, `user` et `identityFile` pour un accès SSH déjà autorisé ; aucun accès privé n’est fourni par défaut. `jobContexts` porte les attributions locales de travail/version ; `remoteMirrors` peut relier des racines distantes à des dossiers locaux explicitement choisis. Configuration réelle, clés et catalogue sont privés, hors distribution.
-
-Le moniteur compatible peut fournir les routes `/api/status` et `/api/mac` sur la boucle locale, port 4420. Il est externe, non fourni et non démarré par AUTORENDER. Le suivi des dossiers Mac peut fonctionner sans lui. Quitter AUTORENDER ferme ses sondes ; le serveur moniteur et les moteurs de rendu restent indépendants. Aucun démarrage automatique de session n’est ajouté.
-
-## Construire et vérifier
-
-Prérequis : macOS 14 ou ultérieur, compilateur Swift et outils Apple ; Python 3 et accès SSH existant pour les dossiers Shadow. Les outils de packaging utilisent `sips` et `iconutil`.
+Prérequis : macOS 14 ou ultérieur, compilateur Swift, outils Apple et Python 3 pour les helpers. Le packaging utilise `sips` et `iconutil`.
 
 ```sh
 bash Scripts/build.sh
-open Build/AUTORENDER.app
 ```
 
-Le script exige une destination neuve afin de préserver les builds précédents ; `AUTORENDER_BUILD_APP` permet d’en choisir une autre. Il compare les hashes des entrées avant/après compilation et embarque un manifeste. La signature ad hoc n’est pas une notarisation Apple.
+Le build exige une destination neuve ; `AUTORENDER_BUILD_APP` permet de la choisir. Il contrôle ses entrées et embarque leur manifeste. La signature ad-hoc n’est ni Developer ID ni notarisation Apple. Ce dépôt ne contient pas le bundle installé ni les données de recette.
 
-Les tests de données sont dans `Tests/`. Le harness UI facultatif se construit séparément :
+## Tests
+
+Les tests console sont dans `Tests/`. Les fixtures de présentation fournissent explicitement leur qualification simulée, pas une preuve de détection depuis l’API historique. `ActiveOnlyProjectionTests.swift` décrit sections et masquage ; `NativeScriptIntegrationTests.swift` couvre le raccord avec des fixtures neutres.
+
+```sh
+python3 Scripts/check-ui-modules.py
+```
+
+Cette commande vérifie interfaces et présentation simulée sans lancer l’application.
+
+Les deux runners ciblés de persistance et de terminal historique utilisent des sources copiées et un stockage temporaire neutre :
+
+```sh
+python3 -B Tests/check_catalog_persistence.py
+python3 -B Tests/check_historical_terminal.py
+```
+
+Seul le runner de persistance instrumente une copie temporaire avant l’écriture atomique ; les sources produit ne contiennent pas de hook de test. Ces fixtures ne prouvent pas l’activité d’un renderer réel.
+
+Le harness facultatif se construit séparément :
 
 ```sh
 bash Scripts/build-ui-harness50.sh
 ```
 
-Ce bundle distinct affiche en permanence **50 JOBS SIMULÉS** et utilise les mêmes vues SCALE avec 50 records neutres, plusieurs travaux/versions, stockage temporaire et suite de préférences isolée. Collecte, réseau et données client sont désactivés ; ses dossiers et fichiers de démonstration sont temporaires et propres au test. Il ne lance aucun rendu réel. Sa fermeture nettoie son stockage et ses préférences propres après export des mesures de projection UI.
+Il contient 50 jobs connus **SIMULÉS**, dont un sous-ensemble actif qualifié, avec stockage et préférences de test. Il ne représente pas 50 rendus réels et ne prouve ni FPS ni performance du binaire normal.
 
-Une mesure de projection dans ce harness n’est ni un temps de frame, ni du FPS, ni la performance du binaire normal sur 50 rendus réels. Compilation, tests de données, recette native sur vraies sources, recette 50 jobs simulés et acceptation humaine sont des preuves distinctes. Un build réussi ne prouve pas la fluidité, l’accessibilité ou la maniabilité des fenêtres.
+Compilation, fixtures, paquet, installation, gestes natifs, persistance et acceptation sont des preuves distinctes. Le statut précis reste dans [VALIDATION.md](VALIDATION.md).

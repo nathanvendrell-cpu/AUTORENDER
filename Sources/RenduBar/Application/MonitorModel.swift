@@ -17,7 +17,7 @@ private struct CachedRemote: Codable {
 @MainActor
 final class MonitorModel: ObservableObject {
     @Published private(set) var entries: [RenderEntry] = []
-    @Published private(set) var thumbnails: [String: NSImage] = [:]
+    var thumbnails:[String:NSImage] {previews.thumbnails}
     @Published private(set) var shadowHealth = SourceHealth()
     @Published private(set) var macHealth = SourceHealth()
     @Published private(set) var folderHealth = SourceHealth()
@@ -27,25 +27,49 @@ final class MonitorModel: ObservableObject {
     @Published private(set) var shadowTasks: [ShadowTask] = []
     @Published private(set) var config = AppConfig()
     @Published private(set) var lastScan = Date()
+    @Published private(set) var configurationError: String?
+    private var configurationWritable = true
+    private let previews: RenderPreviewStore
+    private var previewUpdates:AnyCancellable?
+    @Published private(set) var archiveError: String?
     @Published private(set) var organizationError: String?
-    private var organizationBackupMade = false
     @Published private(set) var catalogSnapshot = RenderCatalogSnapshot.empty
     @Published private(set) var dashboardProjects: [RenderDashboardProject] = []
     private let catalogue: RenderCatalogService
     private let storageRoot: URL
+    private let collectionLifetime=RenderTaskLifetime()
+    @Published private(set) var shutdownIssue:String?
+    private let preferences: RenderConfigStore
     private let collectionEnabled: Bool
     private let folderWorker = FolderCollectionWorker()
+    private let registryWorker = MacMonitorRegistryWorker()
+    private let shadowRuns:ShadowRunDiscovery
+    private var shadowRunUpdates:AnyCancellable?
+    var shadowRunHealth:SourceHealth {shadowRuns.health}
+    private let nativeWorker: NativeRenderDiscovery
+    @Published private(set) var nativeRequestedGeneration:UInt64=0
+    @Published private(set) var nativeCompletedGeneration:UInt64=0
+    @Published private(set) var nativeCatalogueGeneration:UInt64=0
+    private var nativeTask: Task<Void,Never>?
+    @Published private(set) var nativeHealth = SourceHealth()
+    private var nativeObservations: [NativeRenderObservation] = []
+    private var nativeHistoryObservations:[NativeRenderObservation]=[]
+    private let registryURL: URL
+    private var registryFolders: [String:String] = [:]
+    private var registryTask: Task<Void,Never>?
+    private var registryPending = false
+    private var preferenceRevision: UInt64 = 0
+    @Published private(set) var registryDiscoveryError: String?
+    private var declarationTask: Task<Void,Never>?
+    private var lastDeclarationAttempt: Date?
+    private var declarationIdentity: String?
     private var snapshotTask: Task<Void,Never>?
     private var snapshotGeneration: UInt64 = 0
+    private var historyRequestGeneration: UInt64 = 0
     private var folderTask: Task<Void,Never>?
     private var folderBusy = false
     private var folderPending = false
     private var folderRevision: UInt64 = 0
-    private var previewTasks: [String: Task<Void,Never>] = [:]
-    private var requestedPreviews: [String: RenderEntry] = [:]
-    private var previewGeneration: UInt64 = 0
-    private var failedPreviews = Set<String>()
-    private let imageCache = NSCache<NSString, NSImage>()
 
     @Published private(set) var shadowDeclaration: ShadowDashboardDeclaration?
     private var shadowPayload: ShadowResponse?
@@ -71,21 +95,31 @@ final class MonitorModel: ObservableObject {
         MonitorModel(storageRoot:storageRoot,initialSnapshot:snapshot,collectionEnabled:false)
     }
 
-    init(storageRoot: URL? = nil, initialSnapshot: RenderCatalogSnapshot? = nil, collectionEnabled: Bool = true) {
+    init(storageRoot: URL? = nil, initialSnapshot: RenderCatalogSnapshot? = nil, collectionEnabled: Bool = true, previewLoader: RenderPreviewLoader? = nil, nativeReader: (any NativeProcessReading)? = nil, nativeIO:RenderBoundedIO? = nil) {
         let selectedRoot = storageRoot ?? (collectionEnabled ? RenduStorage.root : FileManager.default.temporaryDirectory.appendingPathComponent("autoren-fixture-" + UUID().uuidString,isDirectory:true))
         if !collectionEnabled { precondition(selectedRoot.standardizedFileURL.path != RenduStorage.root.standardizedFileURL.path && !selectedRoot.standardizedFileURL.path.hasPrefix(RenduStorage.root.standardizedFileURL.path + "/"), "Fixture storage must be isolated") }
+        self.shadowRuns=ShadowRunDiscovery(root:selectedRoot)
         self.storageRoot = selectedRoot; self.collectionEnabled = collectionEnabled
-        self.catalogue = RenderCatalogService(root:selectedRoot.appendingPathComponent("Catalog",isDirectory:true))
+        self.registryURL = selectedRoot.appendingPathComponent("monitor-jobs.json")
+        self.nativeWorker = NativeRenderDiscovery(reader:nativeReader ?? NativeProcessReader(),io:nativeIO ?? RenderBoundedIO())
+        self.preferences=RenderConfigStore(root:selectedRoot,lifetime:collectionLifetime)
+        self.catalogue = RenderCatalogService(root:selectedRoot.appendingPathComponent("Catalog",isDirectory:true),lifetime:collectionLifetime)
         let options = URLSessionConfiguration.ephemeral
         options.timeoutIntervalForRequest = 8
         options.timeoutIntervalForResource = 10
         options.requestCachePolicy = .reloadIgnoringLocalCacheData
         session = URLSession(configuration: options)
-        imageCache.totalCostLimit = 16 * 1024 * 1024
-        imageCache.countLimit = 32
+        previews=RenderPreviewStore(root:selectedRoot,session:session,remote:remote,enabled:collectionEnabled,loader:previewLoader,lifetime:collectionLifetime)
+        previewUpdates=previews.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        shadowRunUpdates=shadowRuns.objectWillChange.sink { [weak self] _ in Task { @MainActor [weak self] in guard let self,!self.stopping else{return};self.combine() } }
         ensureStorage()
+        let configLoad=RenderConfigurationLoad.read(selectedRoot.appendingPathComponent("config.json"))
+        switch configLoad {
+        case .missing: config = AppConfig()
+        case .loaded(let saved): config=saved
+        case .unavailable(let message): configurationError=message; configurationWritable=false; config=AppConfig()
+        }
         if !collectionEnabled {
-            config = load("config.json",as:AppConfig.self) ?? AppConfig()
             if let seed=initialSnapshot {
                 for job in seed.jobs where config.jobContexts[job.id] == nil && job.workID != nil && job.sourceWorkID == nil {
                     config.jobContexts[job.id] = RenderJobContext(projectID:job.projectID,workID:job.workID,versionID:job.versionID,workTitle:job.workTitle,versionLabel:job.versionLabel)
@@ -96,14 +130,12 @@ final class MonitorModel: ObservableObject {
             entries = catalogSnapshot.jobs.flatMap(\.previewEntries)
             return
         }
-        if let saved = load("config.json", as: AppConfig.self) {
-            config = saved
-            if !config.importNewMacMonitorFolders(Array(knownFolders().values)).isEmpty {
-                save(config, name: "config.json")
+        if configurationWritable {
+            switch configLoad {
+            case .missing: save(config,name:"config.json")
+            case .loaded: break
+            case .unavailable: break
             }
-        } else {
-            config = AppConfig.bootstrap()
-            save(config, name: "config.json")
         }
         shadowDeclaration = load("shadow-dashboard-declaration.json",as:ShadowDashboardDeclaration.self)
         if let cached: CachedPayload = load("shadow-last-good.json", as: CachedPayload.self),
@@ -124,17 +156,24 @@ final class MonitorModel: ObservableObject {
             remoteHealth.message = "Dernier dossier Shadow enregistré"
             combine()
         }
+        refreshMacRegistry()
+        refreshNativeRenders()
         refreshFolders()
     }
 
     func start() {
-        guard collectionEnabled, timers.isEmpty else { return }
+        guard collectionEnabled, timers.isEmpty,collectionLifetime.isOpen else { return }
         stopping = false
+        refreshMacRegistry()
+        refreshNativeRenders()
+        Task { await shadowRuns.loadLastGood(config.shadowRunSources) }
         Task { await refreshMac() }
         Task { await refreshShadow() }
         Task { await refreshShadowFolders() }
         timers.append(Timer.scheduledTimer(withTimeInterval: 6, repeats: true) { [weak self] _ in
             Task { @MainActor in
+                self?.refreshMacRegistry()
+                self?.refreshNativeRenders()
                 self?.refreshFolders()
                 await self?.refreshMac()
             }
@@ -149,76 +188,112 @@ final class MonitorModel: ObservableObject {
 
     func stop() {
         stopping = true
-        snapshotTask?.cancel(); folderTask?.cancel()
-        requestedPreviews = [:]
-        previewTasks.values.forEach { $0.cancel() }
-        thumbnails = [:]
+        collectionLifetime.invalidate()
+        previews.stop();shadowRuns.stop()
+        snapshotTask?.cancel(); folderTask?.cancel(); declarationTask?.cancel(); registryTask?.cancel(); nativeTask?.cancel()
         timers.forEach { $0.invalidate() }
         timers.removeAll()
         session.invalidateAndCancel()
         remote.cancel()
     }
 
+    func waitForShutdown() async {
+        let native=nativeTask
+        let runs=shadowRuns
+        let registry=registryTask;let snapshot=snapshotTask;let folders=folderTask;let declaration=declarationTask
+        let finished=await RenderBoundedIO.wait(seconds:2) { [previews,remote] in
+            await native?.value
+            await registry?.value;await snapshot?.value;await folders?.value
+            await runs.waitForShutdown();await previews.waitForShutdown();await declaration?.value;await remote.waitForShutdown()
+        }
+        if !finished { shutdownIssue="Arrêt borné · IO encore suspendue, aucune nouvelle publication autorisée" }
+    }
+
     func refreshNow() {
         guard collectionEnabled else { return }
-        failedPreviews.removeAll()
+        retryVisiblePreviews()
+        refreshMacRegistry()
+        refreshNativeRenders()
         refreshFolders()
         Task { await refreshMac() }
         Task { await refreshShadow() }
-        Task { await refreshShadowFolders() }
+        Task { await refreshShadowFolders();await refreshShadowRunDiscovery(force:true) }
     }
 
     func addMacFolder(_ url: URL) {
+        guard configurationWritable else { return }
         folderRevision += 1
-        config.addMacFolder(url.path)
-        save(config, name: "config.json")
+        guard mutatePreferences({ $0.addMacFolder(url.path) }) else { return }
         refreshFolders()
     }
 
     func removeMacFolder(_ path: String) {
+        guard configurationWritable else { return }
         folderRevision += 1
-        config.removeMacFolder(path)
-        save(config, name: "config.json")
+        guard mutatePreferences({ $0.removeMacFolder(path) }) else { return }
         refreshFolders()
     }
 
     @discardableResult
+    func setJobArchived(_ archived: Bool, forJobID id: String) -> Bool {
+        archiveError = nil
+        guard config.archivePayloadError == nil else { archiveError=config.archivePayloadError; return false }
+        guard let job=catalogSnapshot.jobs.first(where:{$0.id==id}) else { archiveError="Rendu inconnu"; return false }
+        if archived && job.isArchived { return true }
+        if !archived && config.jobArchives[id] == nil { return true }
+        if archived && !job.canArchive { archiveError="Achèvement non établi ou activité en cours · archivage refusé"; return false }
+        return updateJobArchives([id], archived:archived)
+    }
+
+    @discardableResult
+    func archiveCompletedJobs() -> Int {
+        let ids=catalogSnapshot.jobs.filter(\.canArchive).map(\.id)
+        guard !ids.isEmpty else { archiveError=nil; return 0 }
+        return updateJobArchives(ids,archived:true) ? ids.count : 0
+    }
+
+    @discardableResult
+    func restoreAllArchivedJobs() -> Int {
+        guard config.archivePayloadError == nil else { archiveError=config.archivePayloadError; return 0 }
+        let ids=Array(config.jobArchives.keys)
+        guard !ids.isEmpty else { archiveError=nil; return 0 }
+        return updateJobArchives(ids,archived:false) ? ids.count : 0
+    }
+
+    @discardableResult
+    func restoreArchivedJobs() -> Int { restoreAllArchivedJobs() }
+
+    private func updateJobArchives(_ ids:[String], archived:Bool) -> Bool {
+        archiveError=nil
+        guard configurationWritable else { archiveError=configurationError;return false }
+        do {
+            config=try preferences.update { config in
+                guard config.archivePayloadError==nil else { throw NSError(domain:"Archives",code:1,userInfo:[NSLocalizedDescriptionKey:config.archivePayloadError!]) }
+                for id in ids { if archived { config.jobArchives[id]=config.jobArchives[id] ?? Date() } else { config.jobArchives.removeValue(forKey:id) } }
+            }
+            preferenceRevision &+= 1
+            combine();return true
+        } catch { archiveError=error.localizedDescription;return false }
+    }
+
+    @discardableResult
     func setJobContext(_ context: RenderJobContext?, forJobID id: String) -> Bool {
+        guard configurationWritable else { organizationError=configurationError; return false }
         organizationError = nil
         guard let job = catalogSnapshot.jobs.first(where: { $0.id == id }) else { organizationError = "Rendu inconnu"; return false }
         if let source = job.sourceWorkID, let chosen = context?.workID, source != chosen { organizationError = "Identité de travail déclarée par la source · étiquette modifiable"; return false }
         if let source = job.sourceVersionID, let chosen = context?.versionID, source != chosen { organizationError = "Identité de version déclarée par la source · étiquette modifiable"; return false }
-        if !organizationBackupMade {
-            let target = storageRoot.appendingPathComponent("config.json")
-            if FileManager.default.fileExists(atPath: target.path) {
-                let backup = storageRoot.appendingPathComponent("config.before-work-organization-" + UUID().uuidString + ".json")
-                do { try FileManager.default.copyItem(at:target,to:backup); try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:backup.path) }
-                catch { organizationError = "Sauvegarde configuration impossible : " + error.localizedDescription; return false }
-            }
-            organizationBackupMade = true
-        }
-        let target = storageRoot.appendingPathComponent("config.json")
         do {
-            let before = try Data(contentsOf:target)
-            var document = try JSONSerialization.jsonObject(with:before) as? [String:Any] ?? [:]
-            var contexts = document["jobContexts"] as? [String:Any] ?? [:]
-            if let context { contexts[id] = try JSONSerialization.jsonObject(with:JSONEncoder().encode(context)) }
-            else { contexts.removeValue(forKey:id) }
-            document["jobContexts"] = contexts
-            let data = try JSONSerialization.data(withJSONObject:document,options:[.prettyPrinted,.sortedKeys])
-            let updated = try JSONDecoder().decode(AppConfig.self,from:data)
-            guard try Data(contentsOf:target) == before else { organizationError="Configuration modifiée ailleurs · réessayer après relecture"; return false }
-            try data.write(to:target,options:.atomic)
-            let rootsChanged = config.macFolders != updated.macFolders || config.shadowFolders != updated.shadowFolders
-            config = updated
-            if rootsChanged { folderRevision += 1; shadowFolderRevision += 1; refreshFolders() }
-            combine(); return true
-        } catch { organizationError = "Organisation non enregistrée : " + error.localizedDescription; return false }
+            let prior=config
+            config=try preferences.update { $0.jobContexts[id]=context }
+            if prior.macFolders != config.macFolders || prior.shadowFolders != config.shadowFolders { folderRevision += 1;shadowFolderRevision += 1;refreshFolders() }
+            combine();return true
+        } catch { organizationError=error.localizedDescription;return false }
     }
 
     func setFolderWorkType(_ type: RenderWorkType?, path: String) {
-        config.folderWorkTypes[path] = type
-        save(config, name: "config.json")
+        guard configurationWritable else { return }
+        guard mutatePreferences({ $0.folderWorkTypes[path]=type }) else { return }
         combine()
     }
 
@@ -241,19 +316,19 @@ final class MonitorModel: ObservableObject {
     }
 
     func addShadowFolder(_ path: String) -> Bool {
+        guard configurationWritable else { return false }
         guard ShadowFolderScanner.validRemotePath(path) else { return false }
         guard !config.shadowFolders.contains(path) else { return true }
         shadowFolderRevision += 1
-        config.shadowFolders.append(path)
-        save(config, name: "config.json")
+        guard mutatePreferences({ $0.shadowFolders.append(path) }) else { return false }
         Task { await refreshShadowFolders() }
         return true
     }
 
     func removeShadowFolder(_ path: String) {
+        guard configurationWritable else { return }
         shadowFolderRevision += 1
-        config.shadowFolders.removeAll { $0 == path }
-        save(config, name: "config.json")
+        guard mutatePreferences({ $0.shadowFolders.removeAll { $0 == path } }) else { return }
         shadowFolderEntries.removeAll { $0.path.map { Self.isInside($0, root: path) } ?? false }
         save(CachedRemote(entries: shadowFolderEntries, at: remoteHealth.lastGoodAt ?? .distantPast),
                           name: "shadow-folders-last-good.json")
@@ -292,11 +367,10 @@ final class MonitorModel: ObservableObject {
             }
             let now = Date()
             save(CachedPayload(data: data, at: now), name: "shadow-last-good.json")
-            if let page = try? await fetch(""), let declared=ShadowDashboardDeclaration.parse(page,sourceURL:base.absoluteString,checkedAt:now), declared.matches(response) {
-                shadowDeclaration=declared; save(declared,name:"shadow-dashboard-declaration.json")
-            } else if shadowDeclaration?.matches(response) != true { shadowDeclaration=nil }
+            if shadowDeclaration?.matches(response) != true { shadowDeclaration=nil }
             guard !Task.isCancelled, !stopping else { return }
             adoptShadow(response, at: now, live: true)
+            refreshDeclarationInBackground(response)
 
         } catch {
             guard !stopping else { return }
@@ -305,6 +379,19 @@ final class MonitorModel: ObservableObject {
             shadowHealth.checkedAt = Date()
             shadowHealth.message = "Moniteur indisponible : \(error.localizedDescription)"
             combine()
+        }
+    }
+
+    private func refreshDeclarationInBackground(_ response:ShadowResponse) {
+        let identity=response.tasks?.map(\.name).sorted().joined(separator:"|") ?? "unknown"
+        if declarationIdentity != identity { declarationTask?.cancel();declarationTask=nil;lastDeclarationAttempt=nil;declarationIdentity=identity }
+        guard declarationTask == nil, lastDeclarationAttempt.map({ Date().timeIntervalSince($0)>=300 }) ?? true else { return }
+        lastDeclarationAttempt=Date()
+        declarationTask=Task {
+            defer { if declarationIdentity==identity { declarationTask=nil } }
+            guard let page=try? await fetch(""),!Task.isCancelled,!stopping,declarationIdentity==identity,
+                  let current=shadowPayload,let declared=ShadowDashboardDeclaration.parse(page,sourceURL:base.absoluteString,checkedAt:Date()),declared.matches(current) else { return }
+            shadowDeclaration=declared;save(declared,name:"shadow-dashboard-declaration.json");combine()
         }
     }
 
@@ -319,19 +406,9 @@ final class MonitorModel: ObservableObject {
         let running = (data.tasks ?? []).filter { $0.state == "Running" }.count
         shadowTasks = data.tasks ?? []
         shadowSummary = "\(data.brut.map(String.init) ?? "?") brutes · \(data.post.map(String.init) ?? "?") finales déclarées · \(running) tâche(s) actives"
-        let now = Date()
-        shadowEntries = (data.latest ?? []).filter { RenderKind.isSupportedExport($0.name) }.map { frame in
-            let id = "shadow-monitor:" + frame.name + ":" + (frame.t ?? "")
-            let modified = RenderDate.parse(frame.t)
-            let firstSeen = shadowSeenAt[id] ?? at
-            shadowSeenAt[id] = firstSeen
-            let stable = live && modified != .distantPast && (now.timeIntervalSince(firstSeen) >= 8 && now.timeIntervalSince(modified) >= 8)
-            return RenderEntry(id: id, source: .shadowMonitor,
-                               job: "Rendu Shadow", filename: frame.name,
-                               modified: modified,
-                               state: stable ? .stable : .pending,
-                               path: nil, previewURL: base.appendingPathComponent("api/frame/" + frame.name).absoluteString)
-        }
+        // Keep unscoped api/frame previews out of current entries until the provider
+        // supplies verifiable run/root/frame provenance. No root is hardcoded here.
+        shadowEntries = []
         shadowSeenAt = shadowSeenAt.filter { key, _ in shadowEntries.contains { $0.id == key } }
         combine()
     }
@@ -414,6 +491,7 @@ final class MonitorModel: ObservableObject {
 
     func refreshShadowFolders() async {
         guard collectionEnabled, !stopping else { return }
+        defer {if !stopping {Task {await self.refreshShadowRunDiscovery()}}}
         guard !shadowRemoteBusy else { return }
         guard !config.shadowFolders.isEmpty else {
             remoteHealth = SourceHealth()
@@ -438,13 +516,19 @@ final class MonitorModel: ObservableObject {
         if remoteHealth.online {
             shadowFolderEntries = result.map { candidate in
                 var entry = candidate
-                if imageCache.object(forKey: entry.id as NSString) != nil { entry.state = .complete }
+                if previews.isCached(entry) { entry.state = .complete }
                 return entry
             }
             save(CachedRemote(entries: shadowFolderEntries, at: Date()),
                               name: "shadow-folders-last-good.json")
         }
         combine()
+    }
+
+    func refreshShadowRunDiscovery(force:Bool=false) async {
+        guard collectionEnabled,!stopping else{return}
+        guard await shadowRuns.hasConfiguredConnection() else{return}
+        await shadowRuns.refresh(config.shadowRunSources,force:force)
     }
 
     private func combine() {
@@ -455,64 +539,10 @@ final class MonitorModel: ObservableObject {
         rebuildSnapshot()
     }
 
-    func setVisiblePreviewEntries(_ candidates: [RenderEntry]) {
-        guard collectionEnabled, !stopping else { return }
-        let images = candidates.filter {
-            ["png","jpg","jpeg","tif","tiff"].contains(($0.filename as NSString).pathExtension.lowercased())
-        }.prefix(2)
-        let next = Dictionary(images.map { ($0.id,$0) }, uniquingKeysWith: { _,new in new })
-        if Set(next.keys) != Set(requestedPreviews.keys) {
-            previewGeneration += 1
-            failedPreviews.removeAll()
-            for (id,task) in previewTasks where next[id] == nil { task.cancel() }
-        }
-        requestedPreviews = next
-        thumbnails = thumbnails.filter { next[$0.key] != nil }
-        startRequestedPreviews()
-    }
-
-    private func startRequestedPreviews() {
-        guard !stopping else { return }
-        for (id,entry) in requestedPreviews where entry.state != .pending && previewTasks.count < 2 && previewTasks[id] == nil && !failedPreviews.contains(id) {
-            if let cached = imageCache.object(forKey: id as NSString) { if thumbnails[id] == nil { thumbnails[id] = cached }; continue }
-            let generation = previewGeneration
-            let cache = cacheURL(id)
-            let roots = config.shadowFolders
-            previewTasks[id] = Task {
-                var succeeded = false
-                defer {
-                    previewTasks.removeValue(forKey: id)
-                    if !succeeded && generation == previewGeneration && !Task.isCancelled { failedPreviews.insert(id) }
-                    if !stopping { startRequestedPreviews() }
-                }
-                var decoded = await Task.detached(priority:.utility) { Self.downsampleFile(cache) }.value
-                if decoded == nil && !Task.isCancelled {
-                    if entry.source == .macFolder, let path=entry.path {
-                        decoded = await Task.detached(priority:.utility) { Self.downsampleFile(URL(fileURLWithPath:path)) }.value
-                    } else {
-                        var data: Data?
-                        if entry.source == .shadowFolder, let path=entry.path { data = await remote.preview(path,roots:roots,id:id) }
-                        else if let raw=entry.previewURL, let url=URL(string:raw), let result=try? await session.data(from:url),
-                                (result.1 as? HTTPURLResponse)?.statusCode == 200 { data=result.0 }
-                        if let data, !Task.isCancelled { decoded = await Task.detached(priority:.utility) { Self.downsampleData(data) }.value }
-                    }
-                }
-                guard let decoded, !Task.isCancelled, !stopping, generation == previewGeneration, requestedPreviews[id] != nil else { return }
-                imageCache.setObject(decoded.0,forKey:id as NSString,cost:Int(decoded.0.size.width * decoded.0.size.height * 4))
-                thumbnails[id] = decoded.0; succeeded = true
-                let bytes=decoded.1
-                await Task.detached(priority:.utility) { try? bytes.write(to:cache,options:.atomic) }.value
-            }
-        }
-    }
-
-    private func cacheURL(_ id: String) -> URL {
-        let hash = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
-        return storageRoot.appendingPathComponent("Previews/" + hash + ".jpg")
-    }
-
-    func thumbnail(for entry: RenderEntry) -> NSImage? { thumbnails[entry.id] }
-
+    func setVisiblePreviewEntries(_ entries:[RenderEntry]) { previews.setVisiblePreviewEntries(entries,roots:config.shadowFolders+shadowRuns.allowedRoots) }
+    func retryVisiblePreviews() { previews.retryVisiblePreviews() }
+    func previewStatus(for entry:RenderEntry)->RenderPreviewStatus {previews.status(for:entry)}
+    func thumbnail(for entry:RenderEntry)->NSImage? {previews.thumbnail(for:entry)}
     func openURL(for entry: RenderEntry) -> URL? {
         if (entry.source == .macFolder || entry.source == .macMonitor), let path = entry.path { return URL(fileURLWithPath: path) }
         // Remote paths have no Finder URL unless an explicitly configured mirror is verified.
@@ -534,6 +564,7 @@ final class MonitorModel: ObservableObject {
     }
 
     func historyEntries(for job: RenderDashboardJob) -> [RenderEntry] {
+        if job.id.hasPrefix("shadow:run:") {return job.previewEntries}
         if job.source == .macMonitor {
             let rawID = String(job.id.dropFirst(4))
             let root = knownFolders()[rawID]
@@ -557,22 +588,41 @@ final class MonitorModel: ObservableObject {
             config:config,knownFolders:knownFolders(),entries:entries,macEntries:macEntries,folderEntries:folderEntries,
             shadowEntries:shadowEntries,shadowFolderEntries:shadowFolderEntries,macHealth:macHealth,shadowHealth:shadowHealth,
             folderHealth:folderHealth,remoteHealth:remoteHealth)
+        input.nativeObservations = nativeObservations
+        input.nativeHistoryObservations=nativeHistoryObservations
+        input.shadowRunJobs = shadowRuns.jobs
         if !collectionEnabled { input.preparedJobs = catalogSnapshot.jobs }
+        let nativeGeneration=nativeCompletedGeneration
         snapshotTask = Task {
             guard let prepared = await catalogue.build(input), !Task.isCancelled, !stopping, generation == snapshotGeneration else { return }
             catalogSnapshot = prepared; dashboardProjects = prepared.projects
+            previews.reconcileVisiblePreviews(prepared)
+            nativeCatalogueGeneration=max(nativeCatalogueGeneration,nativeGeneration)
+            if !prepared.reactivatedArchiveIDs.isEmpty {
+                _ = updateJobArchives(prepared.reactivatedArchiveIDs,archived:false)
+            }
         }
     }
 
+    private func historyRequestIsCurrent(_ request:UInt64, folder:UInt64, shadow:Int) -> Bool {
+        !stopping && historyRequestGeneration == request && folderRevision == folder && shadowFolderRevision == shadow
+    }
+
     func historyPage(for job: RenderDashboardJob, cursor: String? = nil, limit: Int = 40) async -> RenderHistoryPage {
-        if !collectionEnabled {
-            return await catalogue.history(jobID:job.id,incoming:job.previewEntries,cursor:cursor,limit:limit,
-                coverage:"SIMULÉ · aucune collecte/réseau",scope:"fixture:" + job.id)
-        }
+        historyRequestGeneration &+= 1; let request=historyRequestGeneration
         let revision = folderRevision; let shadowRevision = shadowFolderRevision
-        var incoming = historyEntries(for:job); var coverage = "Liste récente bornée · historique complet non indexé"
+        let current: @Sendable () async -> Bool = { [weak self] in
+            guard let model=self else { return false }
+            return await model.historyRequestIsCurrent(request,folder:revision,shadow:shadowRevision)
+        }
+        if !collectionEnabled {
+            return await catalogue.history(jobID:job.id,incoming:cursor == nil ? job.previewEntries : [],cursor:cursor,limit:limit,
+                coverage:"SIMULÉ · aucune collecte/réseau",scope:"fixture:" + job.id,isCurrent:current)
+        }
+        var incoming = cursor == nil ? historyEntries(for:job) : []; var coverage = "Liste récente bornée · historique complet non indexé"
         var roots: [String] = []
-        if job.source == .macMonitor { roots = knownFolders()[String(job.id.dropFirst(4))].map { [$0] } ?? [] }
+        if job.id.hasPrefix("mac:native:") { roots = nativeObservations.first { $0.id == job.id }?.outputRoot.map { [$0] } ?? [] }
+        else if job.source == .macMonitor { roots = knownFolders()[String(job.id.dropFirst(4))].map { [$0] } ?? [] }
         else if job.source == .macFolder {
             roots = config.macFolders.filter { root in
                 let sample = RenderEntry(id:"scope",source:.macFolder,job:"",filename:"",modified:.distantPast,state:.pending,path:root + "/__scope__",previewURL:nil)
@@ -580,7 +630,7 @@ final class MonitorModel: ObservableObject {
             }
         }
         if job.source.isShadow {
-            roots = config.dashboardJobFolders[job.id] ?? []
+            roots = job.id.hasPrefix("shadow:run:") ? job.openTargets.compactMap(\.remoteDisplay) : (config.dashboardJobFolders[job.id] ?? [])
             if roots.isEmpty && job.source == .shadowFolder {
                 roots = config.shadowFolders.filter { root in
                     let sample = RenderEntry(id:"scope",source:.shadowFolder,job:"",filename:"",modified:.distantPast,state:.pending,path:root + "/__scope__",previewURL:nil)
@@ -597,13 +647,13 @@ final class MonitorModel: ObservableObject {
                 else { coverage = "Shadow indisponible · métadonnées conservées" }
             }
         }
-        guard !Task.isCancelled, !stopping, revision == folderRevision, shadowRevision == shadowFolderRevision else {
+        guard !Task.isCancelled, !stopping, revision == folderRevision, shadowRevision == shadowFolderRevision, request == historyRequestGeneration else {
             return RenderHistoryPage(entries:[],nextCursor:nil,totalKnown:nil,coverage:"Scope modifié ou demande annulée",snapshotRevision:catalogSnapshot.revision)
         }
         if cursor != nil { incoming = []; coverage = "Page de l’inventaire chargé · sans nouveau scan" }
         let page = await catalogue.history(jobID:job.id,incoming:incoming,cursor:cursor,limit:limit,coverage:coverage,
-            scope:job.projectID + "|" + roots.joined(separator:"|") + "|" + String(revision) + "|" + String(shadowRevision))
-        guard !Task.isCancelled, !stopping, revision == folderRevision, shadowRevision == shadowFolderRevision else {
+            scope:job.projectID + "|" + roots.joined(separator:"|") + "|" + String(revision) + "|" + String(shadowRevision),isCurrent:current)
+        guard !Task.isCancelled, !stopping, revision == folderRevision, shadowRevision == shadowFolderRevision, request == historyRequestGeneration else {
             return RenderHistoryPage(entries:[],nextCursor:nil,totalKnown:nil,coverage:"Scope modifié ou demande annulée",snapshotRevision:page.snapshotRevision)
         }
         return page
@@ -617,7 +667,119 @@ final class MonitorModel: ObservableObject {
         return "\(macJobs.count) rendu(s) du moniteur · \(config.macFolders.count) dossier(s)"
     }
 
-    private func knownFolders() -> [String:String] { collectionEnabled ? AppConfig.knownMacMonitorFolders() : [:] }
+    private func mutatePreferences(_ body:(inout AppConfig)->Void) -> Bool {
+        guard configurationWritable else { return false }
+        do { config=try preferences.update(body);preferenceRevision &+= 1;configurationError=nil;return true }
+        catch { configurationError=error.localizedDescription;return false }
+    }
+
+    // The actor owns registry and directory IO. Repeated requests coalesce to one follow-up.
+    private func refreshMacRegistry() {
+        guard collectionEnabled, !stopping else { return }
+        if registryTask != nil { registryPending = true; return }
+        let revision = preferenceRevision
+        registryTask = Task {
+            let result = await registryWorker.reconcile(registry:registryURL, store:preferences,
+                                                        writable:configurationWritable)
+            guard !Task.isCancelled, !stopping else { registryTask = nil; return }
+            registryDiscoveryError = result.issue
+            if let folders = result.folders { registryFolders = folders }
+            if let updated = result.config {
+                if revision == preferenceRevision {
+                    let changed = updated.macFolders != config.macFolders
+                    config = updated
+                    if changed { preferenceRevision &+= 1; folderRevision &+= 1; refreshFolders() }
+                } else { registryPending = true }
+            }
+            // Keep source freshness untouched; rebind only the local path association.
+            macEntries = macEntries.map { entry in
+                guard let id = entry.monitorJobID else { return entry }
+                let name = entry.filename
+                let path = registryFolders[id].flatMap { folder -> String? in
+                    guard !name.isEmpty, name != ".", name != "..",
+                          (name as NSString).lastPathComponent == name else { return nil }
+                    return URL(fileURLWithPath:folder).appendingPathComponent(name).path
+                }
+                return RenderEntry(id:entry.id, source:entry.source, job:entry.job, filename:entry.filename,
+                                   modified:entry.modified, state:entry.state, path:path,
+                                   previewURL:entry.previewURL, monitorJobID:entry.monitorJobID)
+            }
+            combine()
+            registryTask = nil
+            if registryPending { registryPending = false; refreshMacRegistry() }
+        }
+    }
+
+    // The existing catalogue displays these candidates, including unqualified script processes.
+    // UI owners can call this explicit association interface without changing collectors/providers.
+    func nativeProcessIdentity(forJobID id: String) -> NativeProcessIdentity? {
+        nativeObservations.first { $0.id==id }?.identity
+    }
+
+    @discardableResult
+    func setNativeRunOutputFolder(_ url: URL, forJobID id: String) -> Bool {
+        guard nativeObservations.contains(where:{$0.id==id}),configurationWritable else { return false }
+        let path=url.standardizedFileURL.path
+        guard mutatePreferences({ $0.dashboardJobFolders[id]=[path] }) else { return false }
+        refreshNativeRenders()
+        return true
+    }
+
+    // The returned ticket is consumed by this collection or a coalesced later generation.
+    @discardableResult
+    func refreshLocalDiscovery() -> UInt64 {
+        guard collectionEnabled,!stopping else { return nativeRequestedGeneration }
+        refreshMacRegistry()
+        let ticket=refreshNativeRenders()
+        refreshFolders()
+        return ticket
+    }
+
+    // Completion means the current health/config and catalogue adopted this ticket; inspect health for failures.
+    func waitForNativeDiscovery(_ ticket:UInt64,timeout:Double=2) async -> Bool {
+        guard timeout.isFinite,timeout>0,ticket>0 else { return false }
+        let deadline=DispatchTime.now().uptimeNanoseconds+UInt64(min(timeout,10)*1_000_000_000)
+        while !stopping,!Task.isCancelled,DispatchTime.now().uptimeNanoseconds<deadline {
+            if nativeCatalogueGeneration>=ticket { return true }
+            do { try await Task.sleep(for:.milliseconds(5)) } catch { return false }
+        }
+        return false
+    }
+
+    @discardableResult
+    private func refreshNativeRenders() -> UInt64 {
+        guard collectionEnabled,!stopping else { return nativeRequestedGeneration }
+        nativeRequestedGeneration &+= 1
+        if nativeTask==nil { launchNativeRenders() }
+        return nativeRequestedGeneration
+    }
+
+    private func launchNativeRenders() {
+        guard collectionEnabled,!stopping,nativeTask==nil else { return }
+        let ticket=nativeRequestedGeneration
+        let revision=preferenceRevision
+        let links=config.dashboardJobFolders
+        nativeTask=Task {
+            let result=await nativeWorker.collect(store:preferences,links:links,writable:configurationWritable)
+            guard !Task.isCancelled,!stopping else { nativeTask=nil;return }
+            nativeHealth=result.health;nativeObservations=result.observations;nativeHistoryObservations=result.historyObservations
+            var preferencesAdopted=true
+            if let updated=result.config {
+                if revision==preferenceRevision {
+                    let changed=updated.macFolders != config.macFolders
+                    config=updated
+                    if changed { preferenceRevision &+= 1;folderRevision &+= 1;refreshFolders() }
+                } else { preferencesAdopted=false }
+            }
+            if preferencesAdopted { nativeCompletedGeneration=max(nativeCompletedGeneration,ticket) }
+            else if nativeRequestedGeneration==ticket { nativeRequestedGeneration &+= 1 }
+            combine()
+            nativeTask=nil
+            if nativeRequestedGeneration>ticket { launchNativeRenders() }
+        }
+    }
+
+    private func knownFolders() -> [String:String] { collectionEnabled ? registryFolders : [:] }
     private func ensureStorage() {
         try? FileManager.default.createDirectory(at:storageRoot,withIntermediateDirectories:true)
         try? FileManager.default.createDirectory(at:storageRoot.appendingPathComponent("Previews"),withIntermediateDirectories:true)
@@ -627,23 +789,18 @@ final class MonitorModel: ObservableObject {
         return try? JSONDecoder().decode(T.self,from:data)
     }
     private func save<T:Encodable>(_ value:T,name:String) {
-        ensureStorage(); guard let data=try? JSONEncoder().encode(value) else { return }
+        guard !stopping,collectionLifetime.isOpen else { return }
+        if name == "config.json" && !configurationWritable { return }
+        ensureStorage(); guard var data=try? JSONEncoder().encode(value) else { return }
+        if let config=value as? AppConfig, config.archivePayloadError != nil {
+            let target=storageRoot.appendingPathComponent(name)
+            guard let old=try? Data(contentsOf:target),let previous=try? JSONSerialization.jsonObject(with:old) as? [String:Any],
+                  var current=try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return }
+            current["jobArchives"]=previous["jobArchives"]
+            guard let preserved=try? JSONSerialization.data(withJSONObject:current,options:.sortedKeys) else { return }
+            data=preserved
+        }
         try? data.write(to:storageRoot.appendingPathComponent(name),options:.atomic)
     }
 
-    nonisolated private static func downsampleFile(_ url: URL) -> (NSImage,Data)? {
-        guard let source=CGImageSourceCreateWithURL(url as CFURL,nil) else { return nil }; return makeThumbnail(source)
-    }
-    nonisolated private static func downsampleData(_ data: Data) -> (NSImage,Data)? {
-        guard let source=CGImageSourceCreateWithData(data as CFData,nil) else { return nil }; return makeThumbnail(source)
-    }
-    nonisolated private static func makeThumbnail(_ source: CGImageSource) -> (NSImage,Data)? {
-        let options:[CFString:Any] = [kCGImageSourceCreateThumbnailFromImageAlways:true,kCGImageSourceThumbnailMaxPixelSize:420,kCGImageSourceCreateThumbnailWithTransform:true]
-        guard let cg=CGImageSourceCreateThumbnailAtIndex(source,0,options as CFDictionary) else { return nil }
-        let output=NSMutableData()
-        guard let destination=CGImageDestinationCreateWithData(output,"public.jpeg" as CFString,1,nil) else { return nil }
-        CGImageDestinationAddImage(destination,cg,[kCGImageDestinationLossyCompressionQuality:0.82] as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else { return nil }
-        return (NSImage(cgImage:cg,size:NSSize(width:cg.width,height:cg.height)),output as Data)
-    }
 }

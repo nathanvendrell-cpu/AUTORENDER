@@ -14,15 +14,20 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 candidate="$staging/AUTORENDER.app"
 mkdir -p "$candidate/Contents/MacOS" "$candidate/Contents/Resources"
-inputs=( "$project"/Sources/RenduBar/*.swift "$project/Sources/RenduBar/shadow_collector.py" "$project/Resources/Info.plist" "$project/Scripts/ExportIcon.swift" "$project/Scripts/build.sh" )
+# One recursive inventory feeds both compilation and the source manifest.
+python3 "$project/Scripts/swift-sources.py" "$project/Sources/RenduBar" > "$staging/swift-before.txt"
+swift_sources=()
+while IFS= read -r source; do swift_sources+=( "$source" ); done < "$staging/swift-before.txt"
+python_helpers=( "$project/Sources/RenduBar/Infrastructure/shadow_collector.py" "$project/Sources/RenduBar/Infrastructure/shadow_run_contract.py" "$project/Sources/RenduBar/Infrastructure/shadow_run_observer.py" "$project/Sources/RenduBar/Infrastructure/native_script_contract.py" )
+inputs=( "${swift_sources[@]}" "$project/Scripts/swift-sources.py" "${python_helpers[@]}" "$project/Scripts/check-python-resources.py" "$project/Resources/Info.plist" "$project/Scripts/ExportIcon.swift" "$project/Scripts/build.sh" )
 (cd "$project"; shasum -a 256 "${inputs[@]#"$project/"}") > "$staging/source-before.sha256"
 swiftc -O -framework AppKit -framework SwiftUI -framework ImageIO \
-  "$project"/Sources/RenduBar/*.swift -o "$candidate/Contents/MacOS/RenduBar"
+  "${swift_sources[@]}" -o "$candidate/Contents/MacOS/RenduBar"
 cp "$project/Resources/Info.plist" "$candidate/Contents/Info.plist"
-cp "$project/Sources/RenduBar/shadow_collector.py" "$candidate/Contents/Resources/shadow_collector.py"
+for helper in "${python_helpers[@]}"; do cp "$helper" "$candidate/Contents/Resources/"; done
 iconset="$staging/AppIcon.iconset"
 mkdir -p "$iconset"
-swiftc -O -framework AppKit "$project/Sources/RenduBar/Logo.swift" \
+swiftc -O -framework AppKit "$project/Sources/RenduBar/UI/Logo.swift" \
   "$project/Scripts/ExportIcon.swift" -o "$staging/ExportIcon"
 "$staging/ExportIcon" "$staging/icon-1024.png"
 for size in 16 32 128 256 512; do
@@ -36,6 +41,8 @@ iconutil -c icns "$iconset" -o "$candidate/Contents/Resources/AppIcon.icns"
 plutil -lint "$candidate/Contents/Info.plist"
 codesign --force --sign - "$candidate"
 codesign --verify --strict "$candidate"
+python3 "$project/Scripts/swift-sources.py" "$project/Sources/RenduBar" > "$staging/swift-after.txt"
+cmp -s "$staging/swift-before.txt" "$staging/swift-after.txt" || { echo 'Swift source inventory changed: candidate rejected.' >&2; exit 1; }
 (cd "$project"; shasum -a 256 "${inputs[@]#"$project/"}") > "$staging/source-after.sha256"
 if ! cmp -s "$staging/source-before.sha256" "$staging/source-after.sha256"; then
   echo 'Source changed during build; candidate rejected.' >&2
@@ -44,6 +51,7 @@ fi
 cp "$staging/source-before.sha256" "$candidate/Contents/Resources/source-manifest.sha256"
 # The manifest is a bundled resource, so sign the final resource tree again.
 codesign --force --sign - "$candidate"
-codesign --verify --strict "$candidate"
+python3 -B "$project/Scripts/check-python-resources.py" "$candidate/Contents/Resources"
+codesign --verify --deep --strict "$candidate"
 mv "$candidate" "$app"
 echo "$app"

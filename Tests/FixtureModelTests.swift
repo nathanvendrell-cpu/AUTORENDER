@@ -22,7 +22,7 @@ import Foundation
         let config=try JSONDecoder().decode(AppConfig.self,from:Data(contentsOf:configFile))
         precondition(config.jobContexts["mac:fixture-0"]?.versionLabel=="v1","fixture writes outside injected store or loses label")
         let files=try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil)
-        precondition(files.contains{$0.lastPathComponent.hasPrefix("config.before-work-organization-")},"organization lacks reversible backup")
+        precondition(files.contains{$0.lastPathComponent.hasPrefix("config.before-preference-change-")},"organization lacks reversible backup")
         let before=model.catalogSnapshot.revision;model.stop();model.refreshNow();model.refreshFolders()
         try await Task.sleep(for:.milliseconds(30))
         precondition(model.catalogSnapshot.revision==before,"stopped fixture publishes late collection")

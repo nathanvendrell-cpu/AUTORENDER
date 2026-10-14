@@ -9,6 +9,8 @@ final class UIHarness50Delegate: NSObject, NSApplicationDelegate {
     private var root: URL?
     private var suiteName: String?
     private var defaults: UserDefaults?
+    private var shutdownTask: Task<Void, Never>?
+    private var shutdownFinished = false
     private let token = UUID().uuidString
     private var fixtureCount: Int {
         let args = ProcessInfo.processInfo.arguments
@@ -34,18 +36,20 @@ final class UIHarness50Delegate: NSObject, NSApplicationDelegate {
             model = fixtureModel
             let overview = window("AUTORENDER — \(fixtureCount) JOBS SIMULÉS · dashboard", size: NSSize(width: 1240, height: 850))
             let compact = window("AUTORENDER — \(fixtureCount) JOBS SIMULÉS · suivi compact", size: NSSize(width: 520, height: 680))
-            overview.contentViewController = NSHostingController(rootView:
+            overview.contentViewController = RenderHostingController(rootView:
                 VStack(spacing: 0) {
                     fixtureBanner
-                    ContentView(model: fixtureModel, openCompact: { compact.makeKeyAndOrderFront(nil) })
+                    ContentView(model: fixtureModel, openCompact: { compact.makeKeyAndOrderFront(nil) }, selectionDefaults: isolatedDefaults)
                 }.defaultAppStorage(isolatedDefaults))
-            compact.contentViewController = NSHostingController(rootView:
+            compact.contentViewController = RenderHostingController(rootView:
                 VStack(spacing: 0) {
                     fixtureBanner
                     MenuSummaryView(model: fixtureModel, detached: true,
                         openOverview: { overview.makeKeyAndOrderFront(nil) },
-                        detach: { compact.makeKeyAndOrderFront(nil) })
+                        detach: { compact.makeKeyAndOrderFront(nil) }, selectionDefaults: isolatedDefaults)
                 }.defaultAppStorage(isolatedDefaults))
+            configureGeometry(overview, initial: NSSize(width: 1240, height: 850), minimum: NSSize(width: 920, height: 680))
+            configureGeometry(compact, initial: NSSize(width: 520, height: 680), minimum: NSSize(width: 480, height: 370))
             windows = [overview, compact]
             let appMenu = NSMenu(title: "Test UI — SIMULÉ")
             appMenu.addItem(NSMenuItem(title: "Quitter le harness simulé", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -72,9 +76,24 @@ final class UIHarness50Delegate: NSObject, NSApplicationDelegate {
     }
     private func window(_ title: String, size: NSSize) -> NSWindow {
         let result = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        result.isOpaque = false
+        result.backgroundColor = .clear
+        result.appearance = RenderStyle.appearance
         result.title = title; result.isReleasedWhenClosed = false
         return result
     }
+    private func configureGeometry(_ window: NSWindow, initial: NSSize, minimum: NSSize) {
+        // Attach SwiftUI content first: its initial hosting size must not replace
+        // the native test window's intended frame with a1x32 frame.
+        guard let placement = RenderWindowGeometry.resolve(saved: nil,
+            screens: NSScreen.screens.map(\.visibleFrame),
+            fallbackScreen: window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame,
+            initial: initial, minimum: minimum) else { return }
+        window.minSize = placement.minimum
+        window.isMovableByWindowBackground = true
+        window.setFrame(placement.frame, display: false)
+    }
+
     private func fixture50(root: URL) throws -> RenderCatalogSnapshot {
         let now = Date()
         let format = ISO8601DateFormatter()
@@ -97,6 +116,8 @@ final class UIHarness50Delegate: NSObject, NSApplicationDelegate {
                 sous: "Fixture UI neutre : aucune scène ni donnée client", total: 240, faites: count, en_cours: [], latest: [], times: times,
                 proc: process, workType: type, projectID: project)
             var view = RenderDashboard.mac(raw, health: health, projectID: project, workType: type)
+            // Harness-only simulated qualification; never inferred from actual legacy API process counts.
+            view.taskQualification = active ? .nativeRenderCommand : nil
             if !video {
                 view = RenderDashboardJob(id: view.id, title: view.title, projectID: project, source: .macFolder, workType: type,
                     rawCount: 1, postCount: nil, rawProgress: nil, postProgress: nil, totalProvenance: nil, activity: .unknown,
@@ -143,6 +164,19 @@ final class UIHarness50Delegate: NSObject, NSApplicationDelegate {
         return RenderCatalogSnapshot(revision: 1, generatedAt: now, jobs: jobs, projects: projects, works: works,
             knownJobCount: jobs.count, observedJobCount: jobs.filter { !$0.retainedHistorical }.count, stateCounts: counts, persistenceIssue: nil)
     }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if shutdownFinished { return .terminateNow }
+        if shutdownTask != nil { return .terminateLater }
+        guard let model else { return .terminateNow }
+        model.stop()
+        shutdownTask = Task { @MainActor in
+            await model.waitForShutdown()
+            shutdownFinished = true
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         model?.stop()
         UIHarness50Metrics.root = nil
@@ -159,7 +193,7 @@ final class UIHarness50Delegate: NSObject, NSApplicationDelegate {
                 }
                 let report: [String: Any] = ["label": "SIMULÉ_UI_ONLY", "real_renders_started": 0,
                     "known_synthetic_jobs": fixtureCount, "projection_metrics": metrics, "native_acceptance": false,
-                    "scope": "Same SCALE views; fixture process; projection timing is not frame time or production performance",
+                    "scope": "Same final UI views; fixture process; projection timing is not frame time or production performance",
                     "mixed_50_case": "10 video works including one with10versions,15audio works,16other records; no audio/video files rendered",
                     "static_launch_counts": [2,3,50], "same_instance_incremental_arrival": "NOT_TESTED_NO_PUBLIC_FIXTURE_UPDATE_API"]
                 try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: reportFile)
