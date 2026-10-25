@@ -111,7 +111,22 @@ struct RenderDashboardJob: Identifiable, Codable {
     let plans: [RenderDashboardPlan]
     let tasks: [ShadowTask]
     let stageDescription: String?
+    var nativeFrameTiming:RenderFrameTiming?=nil
     var previewEntries: [RenderEntry]
+    var contextAssignment:RenderContextAssignment? = nil
+    var remoteArtifact:RenderRemoteArtifact? = nil
+    var outputAvailability:RenderOutputAvailability? = nil
+    var sourceContext:RenderSourceContext? = nil
+    var subprojectID:String? = nil
+    var subprojectTitle:String? = nil
+    var sceneID:String? = nil
+    var sceneTitle:String? = nil
+    var finalOutputProof:RenderFinalOutputProof?=nil
+    var outputExpectedCount:Int?=nil
+    var libraryInvocationID:String?=nil
+    var libraryStartedAtRaw:String?=nil
+    var hasVerifiedProjectContext:Bool? = nil
+    var libraryVersion:String? = nil
     var projectTitle: String? = nil
     var workID: String? = nil
     var versionID: String? = nil
@@ -129,19 +144,24 @@ struct RenderDashboardJob: Identifiable, Codable {
     var isArchived: Bool { archivedAt != nil }
     var isTerminalCounted: Bool {
         guard activity == .countsReached, let rawProgress, rawProgress.completed == rawProgress.total else { return false }
-        if source.isShadow { return postProgress.map { $0.completed == $0.total } ?? false }
+        if source.isShadow && singleStageRender != true { return postProgress.map { $0.completed == $0.total } ?? false }
         return postProgress.map { $0.completed == $0.total } ?? true
     }
-    var canArchive: Bool { isFresh && !retainedHistorical && isTerminalCounted && !isArchived }
+    var isTerminalRender:Bool {isTerminalCounted || nativeRenderOutcome=="complete"}
+    var canArchive: Bool { activity == .countsReached && isTerminalRender && !isDetectedActiveRender && !isArchived }
+    var renderStartedAt:Date? = nil
+    var currentFrame:Int? = nil
+    var nativeRenderOutcome:String? = nil
+    var singleStageRender:Bool? = nil
     var retainedHistorical = false
     var estimatedRemainingSeconds: Double? = nil
     // Task qualification and recent output progression are distinct from GPU utilization.
     var taskQualification: RenderTaskQualification? = nil
     var progressObservedAt: Date? = nil
     var isDetectedActiveRender: Bool {
-        isFresh && !retainedHistorical && !isArchived && activity == .running && taskQualification != nil && !isTerminalCounted
+        isFresh && !retainedHistorical && !isArchived && activity == .running && taskQualification != nil && !isTerminalRender
     }
-    var isFinishedRender: Bool { !isArchived && isTerminalCounted }
+    var isFinishedRender: Bool { !isArchived && isTerminalRender }
     func hasRecentProgress(at now: Date = Date()) -> Bool {
         guard let observed=progressObservedAt else {return false}
         return now.timeIntervalSince(observed)>=0 && now.timeIntervalSince(observed)<=20

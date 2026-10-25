@@ -31,14 +31,16 @@ struct RenderCatalogRecord: Codable {
 struct RenderJobCatalogue: Codable {
     var schemaVersion = 1
     var revision: UInt64 = 0
+    var historyRevision:UInt64=0
     var records: [String: RenderCatalogRecord] = [:]
-    private enum CodingKeys: String, CodingKey { case schemaVersion, revision, records }
+    private enum CodingKeys: String, CodingKey { case schemaVersion, revision, historyRevision, records }
     init() {}
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let version = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
         guard version <= 1 else { throw DecodingError.dataCorruptedError(forKey: .schemaVersion, in: c, debugDescription: "Unsupported catalogue schema") }
         records = try c.decodeIfPresent([String: RenderCatalogRecord].self, forKey: .records) ?? [:]
+        historyRevision = try c.decodeIfPresent(UInt64.self,forKey:.historyRevision) ?? 0
         revision = try c.decodeIfPresent(UInt64.self, forKey: .revision) ?? 0
         schemaVersion = 1
     }
@@ -98,6 +100,25 @@ actor RenderCatalogService {
         self.root = root;self.lifetime=lifetime
     }
     private let lifetime:RenderTaskLifetime?
+    private struct HistoryIdentity:Equatable {
+        let project:String;let subproject:String?;let scene:String?;let work:String?;let version:String?
+        let projectTitle:String?;let subprojectTitle:String?;let sceneTitle:String?;let workTitle:String?;let versionLabel:String?
+        let title:String;let context:String;let assignment:RenderContextAssignment?
+        let terminal:Bool;let active:Bool;let archived:Date?;let output:RenderOutputAvailability?;let libraryVersion:String?
+        init(_ job:RenderDashboardJob) {
+            project=job.projectID;subproject=job.subprojectID;scene=job.sceneID;work=job.workID;version=job.versionID
+            projectTitle=job.projectTitle;subprojectTitle=job.subprojectTitle;sceneTitle=job.sceneTitle;workTitle=job.workTitle;versionLabel=job.versionLabel
+            title=job.title;context=job.contextProvenance;assignment=job.contextAssignment
+            terminal=job.isTerminalRender;active=job.isDetectedActiveRender;archived=job.archivedAt;output=job.outputAvailability;libraryVersion=job.libraryVersion
+        }
+    }
+    private struct ClassificationConfig:Equatable {
+        let bindings:[RenderProjectBinding]?;let rules:[RenderContextRule]?;let roots:[String:String];let contexts:[String:RenderJobContext]
+        init(_ c:AppConfig){bindings=c.projectBindings;rules=c.contextRules;roots=c.folderProjects;contexts=c.jobContexts}
+    }
+    private var classificationConfig:ClassificationConfig?
+    private(set) var classificationPassCount=0
+    private var historyIdentities:[String:HistoryIdentity]=[:]
     private var loaded = false
     private func loadCatalogue() {
         guard !loaded else { return }; loaded = true
@@ -111,9 +132,22 @@ actor RenderCatalogService {
     func build(_ input: RenderCatalogInput) -> RenderCatalogSnapshot? {
         guard !Task.isCancelled,lifetime?.isOpen != false else { return nil }
         loadCatalogue()
+        let resolver=RenderContextResolver(config:input.config)
+        let nextConfig=ClassificationConfig(input.config),reclassify=classificationConfig != nextConfig
+        classificationConfig=nextConfig
         let current = Self.makeJobs(input)
         guard !Task.isCancelled else { return nil }
         for var job in current {
+            if job.id.hasPrefix("shadow:run:") {
+                let prior=catalogue.records[job.id]?.job
+                if let start=job.renderStartedAt {
+                    if let priorStart=prior?.renderStartedAt,prior?.isTerminalRender != true {job.renderStartedAt=priorStart;job.libraryStartedAtRaw=prior?.libraryStartedAtRaw}
+                    job.libraryInvocationID=RenderContextPath.digest(job.id+"|"+String((job.renderStartedAt ?? start).timeIntervalSince1970))
+                } else if job.finalOutputProof == .scriptFinalContract {
+                    job.renderStartedAt=prior?.renderStartedAt;job.libraryStartedAtRaw=prior?.libraryStartedAtRaw;job.libraryInvocationID=prior?.libraryInvocationID
+                }
+                if let raw=job.libraryStartedAtRaw,job.remoteArtifact?.scriptProof != nil {job.remoteArtifact?.startedAt=raw;job.remoteArtifact?.invocationToken=String((job.libraryInvocationID ?? job.id).prefix(32))}
+            }
             let context = input.config.jobContexts[job.id]
             job.workID = job.sourceWorkID ?? context?.workID ?? job.workID ?? "job:" + job.id
             job.versionID = job.sourceVersionID ?? context?.versionID ?? job.versionID ?? job.id
@@ -123,6 +157,7 @@ actor RenderCatalogService {
             job.contextProvenance = context?.workID != nil ? "Configuration utilisateur explicite" : (job.contextProvenance)
             job.retainedHistorical = !job.isFresh
             job.estimatedRemainingSeconds = job.isFresh && job.activity == .running ? job.eta.flatMap { eta in job.observedAt.map { max(0, eta.timeIntervalSince($0)) } } : nil
+            job=resolver.apply(job);classificationPassCount += 1
             let seen = job.observedAt ?? Date()
             var persisted = job; persisted.previewEntries = []
             catalogue.records[job.id] = RenderCatalogRecord(job: persisted, lastSeen: seen)
@@ -132,6 +167,7 @@ actor RenderCatalogService {
         var reactivatedArchives: [String] = []
         for record in catalogue.records.values {
             var job = record.job
+            if reclassify && currentLookup[job.id]==nil {
             let chosen = input.config.jobContexts[job.id]
             job.workID = job.sourceWorkID ?? chosen?.workID ?? ("job:" + job.id)
             job.versionID = job.sourceVersionID ?? chosen?.versionID ?? job.id
@@ -139,6 +175,8 @@ actor RenderCatalogService {
             job.versionLabel = chosen?.versionLabel ?? job.versionLabel
             job.projectID = chosen?.projectID ?? job.baseProjectID ?? job.projectID
             job.contextProvenance = job.sourceWorkID != nil ? "Métadonnée source workID" : (chosen?.workID != nil ? "Configuration utilisateur explicite" : job.contextProvenance)
+                job=resolver.apply(job);classificationPassCount += 1
+            }
             if let live = currentLookup[job.id] { job.previewEntries = live.previewEntries }
             else {
                 job.retainedHistorical = true; job.isFresh = false
@@ -186,6 +224,8 @@ actor RenderCatalogService {
             if a.projectID == b.projectID { return a.id < b.id }
             return a.projectID < b.projectID
         }
+        let identities=Dictionary(all.map{($0.id,HistoryIdentity($0))},uniquingKeysWith:{$1})
+        if identities != historyIdentities {catalogue.historyRevision &+= 1;historyIdentities=identities}
         catalogue.revision = max(catalogue.revision + 1, input.revision)
         guard !Task.isCancelled else { return nil }
         if persistenceAllowed {
@@ -207,7 +247,7 @@ actor RenderCatalogService {
         }
         return RenderCatalogSnapshot(revision: catalogue.revision, generatedAt: Date(), jobs: all,
             projects: RenderDashboard.projects(all), works: works, knownJobCount: all.count,
-            observedJobCount: currentLookup.values.filter(\.isFresh).count,stateCounts:counts,persistenceIssue:persistenceIssue ?? input.config.archivePayloadError,reactivatedArchiveIDs:reactivatedArchives)
+            observedJobCount: currentLookup.values.filter(\.isFresh).count,stateCounts:counts,persistenceIssue:persistenceIssue ?? input.config.archivePayloadError,reactivatedArchiveIDs:reactivatedArchives,historyRevision:catalogue.historyRevision,libraryJobs:current.filter{$0.finalOutputProof != nil || $0.isDetectedActiveRender}.compactMap{catalogue.records[$0.id]?.job})
     }
 
     private static func semanticData(_ data:Data) -> Data? {
@@ -276,7 +316,7 @@ actor RenderCatalogService {
                 sharedRoot:observation.outputRoot.map { nativeRoots[$0,default:0]>1 || monitoredRoots.contains($0) } ?? false)
             if let root=observation.outputRoot,!dismissedRoots.contains(root) {
                 result.openTargets=[folderTarget(root,title:observation.producer,remote:false,config:config,remoteHealth:input.remoteHealth)]
-                result.latestOutput=input.folderEntries.filter { $0.path.map(observation.previewScopeIncludes) ?? false }.max { $0.modified < $1.modified }
+                result.latestOutput=observation.receiptBoundPreview ? observation.verifiedPreviewEntry:input.folderEntries.filter { $0.path.map(observation.previewScopeIncludes) ?? false }.max { $0.modified < $1.modified }
                 result.revealURL=verifiedOutputURL(result.latestOutput,targets:result.openTargets)
             }
             result=RenderDashboard.applyingProjectLink(result,links:config.dashboardProjectLinks)

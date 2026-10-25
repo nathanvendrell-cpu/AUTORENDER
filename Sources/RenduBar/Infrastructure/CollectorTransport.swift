@@ -8,6 +8,17 @@ enum CollectorProcess {
     private static var running: [UUID: Process] = [:]
     private static var cancelled = Set<UUID>()
 
+    private static var remoteEnabled=true
+    static var remoteAccessEnabled:Bool {lock.lock();defer{lock.unlock()};return remoteEnabled}
+    static func setRemoteAccessEnabled(_ enabled:Bool) {
+        lock.lock();remoteEnabled=enabled
+        let processes=enabled ? []:Array(running.values)
+        if !enabled {cancelled.formUnion(running.keys)}
+        lock.unlock()
+        // Only Python/SSH helpers registered by this app, never a renderer or user process.
+        for process in processes where process.isRunning {process.terminate()}
+    }
+
     static func cancel(_ token: UUID) {
         lock.lock(); cancelled.insert(token); let process=running[token]; lock.unlock()
         if let process, process.isRunning { process.terminate() }
@@ -32,18 +43,18 @@ enum CollectorProcess {
     }
 
     static func run(arguments: [String], timeout: TimeInterval, token: UUID,fixtureHelperURL:URL? = nil) -> Data? {
-        lock.lock(); let alreadyCancelled=cancelled.remove(token) != nil; lock.unlock()
+        lock.lock(); let alreadyCancelled=cancelled.remove(token) != nil || !remoteEnabled; lock.unlock()
         guard !alreadyCancelled else { return nil }
         defer { lock.lock(); cancelled.remove(token); lock.unlock() }
         // A single one-shot SSH helper at a time; waiting requests remain cancellable.
         let gateDeadline=Date().addingTimeInterval(timeout)
         while !transportGate.try() {
-            lock.lock();let aborted=cancelled.contains(token);lock.unlock()
+            lock.lock();let aborted=cancelled.contains(token) || !remoteEnabled;lock.unlock()
             if aborted || Date()>=gateDeadline {return nil}
             usleep(10_000)
         }
         defer {transportGate.unlock()}
-        lock.lock();let aborted=cancelled.contains(token);lock.unlock()
+        lock.lock();let aborted=cancelled.contains(token) || !remoteEnabled;lock.unlock()
         guard !aborted,Date()<gateDeadline else{return nil}
 
         guard let script=fixtureHelperURL ?? Bundle.main.url(forResource:"shadow_collector",withExtension:"py"),
@@ -69,8 +80,9 @@ enum CollectorProcess {
         process.standardError = errHandle
         let done = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in done.signal() }
-        do { try process.run() } catch { return nil }
         lock.lock()
+        guard remoteEnabled,!cancelled.contains(token) else{lock.unlock();return nil}
+        do {try process.run()} catch {lock.unlock();return nil}
         running[token] = process
         let cancelAfterLaunch=cancelled.contains(token)
         lock.unlock()

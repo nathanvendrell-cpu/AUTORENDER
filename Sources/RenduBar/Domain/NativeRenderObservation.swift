@@ -13,6 +13,21 @@ struct NativeProcessIdentity: Codable, Equatable, Hashable {
     }
 }
 
+struct NativeJobReceiptBinding:Codable,Equatable {
+    let directory:String
+    let identity:NativeProcessIdentity
+    let jobSHA256:String
+    let sceneSHA256:String
+    let rendererSHA256:String
+}
+
+struct RenderFrameTiming:Codable,Equatable {
+    let meanSeconds:Double
+    let sampleCount:Int
+    var latestSeconds:Double?=nil
+    var provenance:String {"Durées de rendu du reçu de ce job · frames réutilisées exclues"}
+}
+
 // argv is transient input only; never encoded, persisted, logged, or copied into a catalogue.
 struct NativeProcessSnapshot {
     let identity: NativeProcessIdentity
@@ -23,7 +38,13 @@ struct NativeRenderObservation {
     let identity: NativeProcessIdentity
     let producer: String
     var scene: String?
+    var nativeSceneName:String?
     var script: String?
+    var frameTiming:RenderFrameTiming?=nil
+    var receiptBoundPreview=false
+    var verifiedPreviewEntry:RenderEntry?=nil
+    var jobDirectory: String?
+    var activityOverride: RenderActivity?
     var outputRoot: String?
     var outputPattern: String?
     var renderCommand = false
@@ -89,7 +110,7 @@ struct NativeRenderObservation {
             $0.modified >= identity.bornAt && now.timeIntervalSince($0.modified) >= 0 && now.timeIntervalSince($0.modified) <= 20
         }
         let terminal=stableOutputCountVerified && completed != nil && completed==declaredTotal && (declaredTotal ?? 0)>0
-        let activity: RenderActivity = terminal ? .countsReached : (taskQualification != nil || metadataAdvanced || outputAdvanced ? .running : .unknown)
+        let activity: RenderActivity = activityOverride ?? (terminal ? .countsReached : (taskQualification != nil || metadataAdvanced || outputAdvanced ? .running : .unknown))
         let progress=completed.flatMap { n in declaredTotal.flatMap { RenderProgress(completed:n,total:$0) } }
         let title=automaticComponentTitle ?? (producer + " · " + (scene.map { ($0 as NSString).lastPathComponent } ?? "processus candidat"))
         var job=RenderDashboardJob(id:id,title:title,projectID:projectID ?? "native:" + id,source:.macMonitor,
@@ -99,6 +120,8 @@ struct NativeRenderObservation {
             lastActivity:metadataAdvanced ? metadataObservedAt : outputs.first?.modified,historicalMedianSeconds:nil,
             sampledOutputsLastHour:nil,eta:nil,process:nil,gpu:nil,gpuRaw:nil,plans:[],tasks:[],
             stageDescription:outputAdvanced ? "Sortie récente · commande de rendu associée" : (sharedRoot && !metadataAdvanced ? stage + " · dossier partagé, activité non attribuée" : stage),previewEntries:Array(outputs.filter { $0.kind == .image }.prefix(2)))
+        if receiptBoundPreview {job.previewEntries=verifiedPreviewEntry.map{[$0]} ?? []}
+        job.nativeFrameTiming=frameTiming
         if let project=automaticProjectTitle {job.projectTitle=project};if let label=automaticVersionLabel {job.versionLabel=label}
         if !processPresent {job.isFresh=false;job.retainedHistorical=true}
         job.taskQualification=processPresent ? taskQualification : nil
@@ -106,6 +129,11 @@ struct NativeRenderObservation {
         job.workTitle=automaticComponentTitle
         job.workID=workID;job.versionID=versionID;job.sourceWorkID=workID;job.sourceVersionID=versionID
         job.contextProvenance = automaticComponentTitle != nil ? "Contrat statique du producteur · libellés issus des arguments · lien métier non déclaré" : runID == nil ? "Processus local observé · lien métier non déclaré" : "Métadonnées locales explicites"
+        job.sourceContext=RenderSourceContext(filePath:scene,sceneName:nativeSceneName,scriptPath:script,outputPath:outputPattern ?? outputRoot,namespace:"mac-local",origin:automaticComponentTitle == nil ? .commandLine:.staticProducer).sanitized
+        job.renderStartedAt=identity.bornAt
+        job.singleStageRender=true
+        if terminal,outputScopeIsExclusive,outputPattern != nil {job.finalOutputProof = .verifiedCounters;job.outputExpectedCount=declaredTotal;job.outputAvailability = .fileAttested}
+        job.libraryInvocationID=identity.jobID
         job.baseProjectID=job.projectID
         return job
     }

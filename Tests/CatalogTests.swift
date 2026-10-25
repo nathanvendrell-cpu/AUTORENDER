@@ -5,16 +5,7 @@ import Foundation
     static func require(_ ok: @autoclosure ()->Bool,_ text:String) { checks += 1; precondition(ok(),text) }
     static func input(_ jobs:[MacJob], config:AppConfig=AppConfig(), revision:UInt64=1) -> RenderCatalogInput {
         var health=SourceHealth();health.online=true;health.observedAt=RenderDate.parse("2026-10-12T12:00:00Z")
-        var input=RenderCatalogInput(revision:revision,macJobs:jobs,shadow:nil,declaration:nil,config:config,knownFolders:[:],entries:[],macEntries:[],folderEntries:[],shadowEntries:[],shadowFolderEntries:[],macHealth:health,shadowHealth:SourceHealth(),folderHealth:SourceHealth(),remoteHealth:SourceHealth())
-        // Catalogue fixtures explicitly provide qualified tasks; legacy API process counters alone do not.
-        input.preparedJobs=jobs.map { raw in
-            var job=RenderDashboard.mac(raw,health:health,projectID:raw.projectID ?? "neutral",workType:raw.workType)
-            job.taskQualification = .nativeRenderCommand
-            job.workID=raw.workID;job.versionID=raw.versionID
-            job.sourceWorkID=raw.workID;job.sourceVersionID=raw.versionID
-            return job
-        }
-        return input
+        return RenderCatalogInput(revision:revision,macJobs:jobs,shadow:nil,declaration:nil,config:config,knownFolders:[:],entries:[],macEntries:[],folderEntries:[],shadowEntries:[],shadowFolderEntries:[],macHealth:health,shadowHealth:SourceHealth(),folderHealth:SourceHealth(),remoteHealth:SourceHealth())
     }
     static func jobs(_ count:Int)->[MacJob] {
         let times=["2026-10-12T11:57:00Z","2026-10-12T11:58:00Z","2026-10-12T11:59:00Z"]

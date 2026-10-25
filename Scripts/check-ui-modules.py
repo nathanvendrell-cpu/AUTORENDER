@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory(prefix='autorender-ui-check-',dir='/private/tmp
  after_sources=subprocess.check_output(['python3',str(project/'Scripts/swift-sources.py'),str(project/'Sources/RenduBar')],text=True).splitlines()
  report['inputs_stable']=report['before']==report['after'] and sources==after_sources
  report['status']='PASS' if report['inputs_stable'] and all(c['exit']==0 for c in report['checks'].values()) else 'FAILED_OR_SOURCE_CHANGED'
-output=project/'Evidence/AUTORENDER-MACOS-060-UI-CHECKS-20261012.json'
+output=project/'Build/Products.noindex/ui-checks.json'
 output.parent.mkdir(parents=True,exist_ok=True)
 output.write_text(json.dumps(report,indent=2)+'\n')
 print(json.dumps({'status':report['status'],'inputs_stable':report['inputs_stable'],'checks':report['checks'],'report':str(output)}))

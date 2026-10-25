@@ -16,12 +16,13 @@ enum WorkFilter: String, CaseIterable {
 
 // UI projection is rebuilt only for a snapshot/filter change; it never parses source payloads.
 enum CatalogScope: String, CaseIterable {
-    case follow = "À suivre", direct = "En cours", finished = "Terminés", archived = "Archives", all = "Tous"
-    static let mainSections: [CatalogScope] = [.direct, .finished, .archived]
+    case follow = "À suivre", direct = "En cours", finished = "Rendus faits", archived = "Archives", unclassified = "À classer", all = "Tous"
+    static let mainSections: [CatalogScope] = [.direct, .finished, .archived, .unclassified]
     static func dashboardScope(for job: RenderDashboardJob) -> CatalogScope? {
         if CatalogScope.direct.matches(job) { return .direct }
-        if job.isArchived && job.isTerminalCounted { return .archived }
+        if job.isArchived && job.isTerminalRender { return .archived }
         if job.isFinishedRender { return .finished }
+        if !job.isArchived, job.contextAssignment != .assigned { return .unclassified }
         return nil
     }
     func matches(_ job: RenderDashboardJob) -> Bool {
@@ -30,7 +31,8 @@ enum CatalogScope: String, CaseIterable {
         case .follow: return !job.isArchived || active
         case .direct: return active
         case .finished: return job.isFinishedRender
-        case .archived: return job.isArchived && job.isTerminalCounted
+        case .archived: return job.isArchived && job.isTerminalRender
+        case .unclassified: return !job.isArchived && job.contextAssignment != .assigned
         case .all: return true
         }
     }

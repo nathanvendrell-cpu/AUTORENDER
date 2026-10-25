@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import CryptoKit
 import ImageIO
+import Darwin
 
 enum RenderPreviewStatus: String, Equatable {
     case pending, loading, failed, ready
@@ -26,6 +27,36 @@ typealias RenderPreviewLoader = (RenderEntry) async -> (NSImage,Data)?
     private let remote:ShadowFolderScanner
     private let collectionEnabled:Bool
     private let injectedPreviewLoader:RenderPreviewLoader?
+    private struct OwnerRequest {let entries:[RenderEntry];let roots:[String]}
+    private var owners:[String:OwnerRequest]=[:]
+    private var compactPreviewsVisible=false
+    func setCompactPreviewsVisible(_ visible:Bool){compactPreviewsVisible=visible;rebuildOwners()}
+    var visiblePreviewIDs:Set<String>{Set(requestedPreviews.keys)}
+    func setCompactPreview(_ entry:RenderEntry?,forJobID jobID:String) {
+        guard !jobID.isEmpty,jobID.utf8.count<=256 else{return}
+        let entries=entry.flatMap{$0.source == .macFolder && $0.monitorJobID==jobID ? $0:nil}.map{[$0]} ?? []
+        setOwner("compact:"+jobID,entries:entries,roots:[])
+    }
+    private func setOwner(_ owner:String,entries:[RenderEntry],roots:[String]) {
+        let images=entries.filter{["png","jpg","jpeg","tif","tiff"].contains(($0.filename as NSString).pathExtension.lowercased())}
+        if images.isEmpty {owners.removeValue(forKey:owner)}
+        else if owner=="detail" {owners[owner]=OwnerRequest(entries:Array(images.prefix(8)),roots:roots)}
+        else if owners[owner] != nil || owners.keys.filter({$0.hasPrefix("compact:")}).count<15 {
+            owners[owner]=OwnerRequest(entries:Array(images.prefix(1)),roots:roots)
+        }
+        rebuildOwners()
+    }
+    private func rebuildOwners() {
+        let ordered=owners.keys.sorted {left,right in
+            if left=="detail"{return right != "detail"};if right=="detail"{return false};return left<right
+        }
+        var union:[RenderEntry]=[],seen=Set<String>(),allRoots=Set<String>()
+        for owner in ordered where compactPreviewsVisible || !owner.hasPrefix("compact:") {
+            guard let request=owners[owner] else{continue};allRoots.formUnion(request.roots)
+            for entry in request.entries where seen.insert(entry.id).inserted && union.count<8 {union.append(entry)}
+        }
+        replaceVisiblePreviewEntries(union,roots:allRoots.sorted())
+    }
     private var roots:[String]=[]
     private var stopping=false
     private let lifetime:RenderTaskLifetime
@@ -39,7 +70,7 @@ typealias RenderPreviewLoader = (RenderEntry) async -> (NSImage,Data)?
         self.lifetime=lifetime ?? RenderTaskLifetime()
         imageCache.totalCostLimit=16*1024*1024;imageCache.countLimit=32
     }
-    func stop() { stopping=true;lifetime.invalidate();requestedPreviews=[:];previewTasks.values.forEach{$0.cancel()};thumbnails=[:];publishStates() }
+    func stop() { stopping=true;lifetime.invalidate();owners=[:];requestedPreviews=[:];previewTasks.values.forEach{$0.cancel()};thumbnails=[:];publishStates() }
     func waitForShutdown() async {for task in Array(previewTasks.values) {await task.value}}
     func status(for entry:RenderEntry)->RenderPreviewStatus {
         guard requestedPreviews[entry.id].map(RenderPreviewRequest.cacheIdentity)==RenderPreviewRequest.cacheIdentity(entry) else{return .pending}
@@ -57,11 +88,14 @@ typealias RenderPreviewLoader = (RenderEntry) async -> (NSImage,Data)?
     }
     func isCached(_ entry:RenderEntry)->Bool {imageCache.object(forKey:RenderPreviewRequest.cacheIdentity(entry) as NSString) != nil}
     func setVisiblePreviewEntries(_ candidates:[RenderEntry], roots:[String]) {
+        setOwner("detail",entries:candidates,roots:roots)
+    }
+    private func replaceVisiblePreviewEntries(_ candidates:[RenderEntry], roots:[String]) {
         guard (collectionEnabled || injectedPreviewLoader != nil), !stopping else { return }
         self.roots=roots
         let images = candidates.filter {
             ["png","jpg","jpeg","tif","tiff"].contains(($0.filename as NSString).pathExtension.lowercased())
-        }.prefix(2)
+        }.prefix(8)
         let next = Dictionary(images.map { ($0.id,$0) }, uniquingKeysWith: { _,new in new })
         if Set(next.values.map(RenderPreviewRequest.cacheIdentity)) != Set(requestedPreviews.values.map(RenderPreviewRequest.cacheIdentity)) {
             previewGeneration += 1
@@ -83,9 +117,17 @@ typealias RenderPreviewLoader = (RenderEntry) async -> (NSImage,Data)?
     }
 
     func reconcileVisiblePreviews(_ snapshot:RenderCatalogSnapshot) {
-        guard !requestedPreviews.isEmpty else { return }
+        guard !owners.isEmpty else { return }
         let indexed=Dictionary(snapshot.jobs.flatMap(\.previewEntries).map { ($0.id,$0) },uniquingKeysWith:{ _,new in new })
-        setVisiblePreviewEntries(requestedPreviews.values.map { indexed[$0.id] ?? $0 },roots:roots)
+        for key in Array(owners.keys) {
+            guard let owner=owners[key] else{continue}
+            if key.hasPrefix("compact:") {
+                let jobID=String(key.dropFirst("compact:".count))
+                let latest=snapshot.jobs.first(where:{$0.id==jobID})?.previewEntries.first(where:{$0.source == .macFolder && $0.monitorJobID==jobID && $0.localPreviewProof?.jobID==jobID})
+                owners[key]=OwnerRequest(entries:latest.map{[$0]} ?? [],roots:[])
+            } else {owners[key]=OwnerRequest(entries:owner.entries.map{indexed[$0.id] ?? $0},roots:owner.roots)}
+        }
+        rebuildOwners()
     }
 
     private func startRequestedPreviews() {
@@ -109,8 +151,10 @@ typealias RenderPreviewLoader = (RenderEntry) async -> (NSImage,Data)?
                 else { decoded = await Task.detached(priority:.utility) { Self.downsampleFile(cache) }.value }
                 if decoded == nil && !Task.isCancelled && injectedPreviewLoader == nil {
                     if entry.source == .macFolder, let path=entry.path {
-                        decoded = await Task.detached(priority:.utility) { Self.downsampleFile(URL(fileURLWithPath:path)) }.value
-                    } else {
+                        decoded = await Task.detached(priority:.utility) {
+                            entry.localPreviewProof != nil ? Self.downsampleVerifiedFile(entry):Self.downsampleFile(URL(fileURLWithPath:path))
+                        }.value
+                    } else if !entry.source.isShadow || CollectorProcess.remoteAccessEnabled {
                         var data: Data?
                         if entry.source == .shadowFolder, let path=entry.path { data = await remote.preview(path,roots:roots,id:identity) }
                         else if let raw=entry.previewURL, let url=URL(string:raw), let result=try? await session.data(from:url),
@@ -138,6 +182,28 @@ typealias RenderPreviewLoader = (RenderEntry) async -> (NSImage,Data)?
 
     func thumbnail(for entry: RenderEntry) -> NSImage? { thumbnails[entry.id] }
 
+    nonisolated private static func downsampleVerifiedFile(_ entry:RenderEntry)->(NSImage,Data)? {
+        guard let path=entry.path,let proof=entry.localPreviewProof,proof.jobID==entry.monitorJobID,
+              proof.stamp.bytes>0,proof.stamp.bytes<=128*1024*1024 else{return nil}
+        let fd=open(path,O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC);guard fd>=0 else{return nil};defer{close(fd)}
+        func matches()->Bool {
+            var s=stat();return fstat(fd,&s)==0 && (s.st_mode & S_IFMT)==S_IFREG
+                && UInt64(s.st_dev)==proof.stamp.device && UInt64(s.st_ino)==proof.stamp.inode && s.st_size==proof.stamp.bytes
+                && Int64(s.st_mtimespec.tv_sec)==proof.stamp.modifiedSeconds && Int64(s.st_mtimespec.tv_nsec)==proof.stamp.modifiedNanoseconds
+                && Int64(s.st_ctimespec.tv_sec)==proof.changedSeconds && Int64(s.st_ctimespec.tv_nsec)==proof.changedNanoseconds
+        }
+        guard matches() else{return nil}
+        var data=Data(),buffer=[UInt8](repeating:0,count:1024*1024)
+        while true {
+            guard !Task.isCancelled else{return nil}
+            let n=buffer.withUnsafeMutableBytes{Darwin.read(fd,$0.baseAddress,$0.count)}
+            if n==0{break};if n<0{if errno==EINTR{continue};return nil}
+            guard data.count+n<=proof.stamp.bytes else{return nil};data.append(contentsOf:buffer.prefix(n))
+        }
+        guard data.count==proof.stamp.bytes,matches(),
+              (try? RenderLibraryFileStamp.read(URL(fileURLWithPath:path)))==proof.stamp else{return nil}
+        return downsampleData(data)
+    }
     nonisolated private static func downsampleFile(_ url: URL) -> (NSImage,Data)? {
         guard let source=CGImageSourceCreateWithURL(url as CFURL,nil) else { return nil }; return makeThumbnail(source)
     }

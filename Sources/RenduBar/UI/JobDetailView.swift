@@ -32,14 +32,15 @@ struct JobDetailView: View {
                     .font(.system(size: 12)).foregroundStyle(muted)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), alignment: .top)], alignment: .leading, spacing: 12) {
-                DashboardProgressView(title: job.source == .shadowMonitor ? "Images brutes" : (job.source == .macMonitor ? "Images comptées" : "Fichiers détectés"), count: job.rawCount, progress: job.rawProgress, isFresh: job.isFresh && !job.retainedHistorical, activity: job.activity, compact: true)
-                if job.source == .shadowMonitor || job.postCount != nil {
+                DashboardProgressView(title: job.singleStageRender == true ? "Progression" : (job.source == .shadowMonitor ? "Images brutes" : (job.source == .macMonitor ? "Images comptées" : "Fichiers détectés")), count: job.rawCount, progress: job.rawProgress, isFresh: job.isFresh && !job.retainedHistorical, activity: job.activity, compact: true)
+                if job.singleStageRender != true && (job.postProgress != nil || job.postCount != nil) {
                     DashboardProgressView(title: "Images post", count: job.postCount, progress: job.postProgress, isFresh: job.isFresh && !job.retainedHistorical, activity: job.activity, compact: true)
                 }
             }
-            if job.isFresh, !job.retainedHistorical, job.activity == .running, let eta = job.eta {
-                metric("Fin estimée au rythme mesuré", value: eta.formatted(date: .abbreviated, time: .shortened), detail: "Source récente · processus actif · total déclaré")
+            if job.isFresh, !job.retainedHistorical, job.activity == .running, let eta = job.eta, eta.timeIntervalSinceNow.isFinite, eta.timeIntervalSinceNow > 0 {
+                metric("Fin estimée au rythme mesuré", value: eta.formatted(date: .abbreviated, time: .shortened), detail: "Cadence qualifiée pour cette version")
             }
+            ClassifiedOutputLinksView(model: model, jobID: job.id)
             previews(job)
             HStack {
                 Text("Exports de cette version").font(.system(size: 12)).foregroundStyle(muted)
@@ -72,8 +73,14 @@ struct JobDetailView: View {
         CatalogFolderMenu(targets: job.openTargets, latest: job.latestOutput, revealURL: job.revealURL)
     }
     private var archiveAction: some View {
-        Button(model.config.jobArchives[job.id] != nil ? "Restaurer" : "Archiver") { model.setJobArchived(model.config.jobArchives[job.id] == nil, forJobID: job.id) }
-            .disabled(model.config.jobArchives[job.id] == nil && !job.canArchive).buttonStyle(.bordered)
+        Button(model.config.jobArchives[job.id] != nil ? "Restaurer" : "Retirer vers Archives") {
+            let restoring = model.config.jobArchives[job.id] != nil
+            if model.setJobArchived(!restoring, forJobID: job.id), restoring {
+                NotificationCenter.default.post(name: CatalogProjectionSnapshot.request, object: model,
+                    userInfo: ["restoredJobID": job.id])
+            }
+        }.disabled(model.config.jobArchives[job.id] == nil && !job.canArchive).buttonStyle(.bordered)
+            .help("Archivage réversible dans AUTORENDER. Aucun rendu ni fichier n’est supprimé.")
     }
     private var organizeAction: some View {
         Button("Organiser") { onOrganize(job) }.buttonStyle(.bordered)

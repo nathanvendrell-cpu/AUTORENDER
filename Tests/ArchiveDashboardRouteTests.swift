@@ -6,8 +6,8 @@ import Foundation
   var health=SourceHealth();health.online=true;health.observedAt=Date()
   var j=RenderDashboard.mac(MacJob(id:id,titre:"Same visible title",sous:nil,total:10,faites:active ? 3 : 10,en_cours:[],latest:[],times:[],proc:active ? MacProcess(cpu:"1",ram_mo:1,duree:"00:01") : nil),health:health,projectID:project,workType:.video)
   j.workID="same-work";j.workTitle="Same work title";j.projectTitle="Same project title"
-  j.taskQualification=active ? .nativeRenderCommand:nil // SIMULATED qualified task, not legacy API attribution.
   if archived {j.archivedAt=Date(timeIntervalSince1970:1700000000)}
+  j.taskQualification = active ? .nativeRenderCommand : nil
   return j
  }
  @MainActor static func main() async throws {
@@ -40,9 +40,9 @@ import Foundation
   check(mini.dashboardNavigation?.jobID==request.jobID,"repeat loses identity")
   mini.openInDashboard(active,workID:"same-work")
   guard let live=mini.dashboardNavigation else {preconditionFailure("active request absent")}
-  check(live.scope == .direct,"qualified active route must request En cours")
+  check(live.scope == .direct,"qualified active route does not request direct scope")
   dashboard.apply(live);store.rebuild(snapshot,query:"",scope:live.scope);dashboard.reconcile(store)
-  check(dashboard.jobID==active.id && store.visibleJobIDs.contains(active.id),"qualified active version not selected in En cours")
+  check(dashboard.jobID==active.id && store.visibleJobIDs.contains(active.id),"active version not selected in direct")
   check(!active.canArchive && !active.isArchived && archived.isArchived,"navigation changed archive status or active protection")
   defaults[0].synchronize()
   let freshDefaults=UserDefaults(suiteName:suites[0])!;let reopened=CatalogSelectionController(defaults:freshDefaults)
@@ -70,12 +70,47 @@ import Foundation
   check(dashboard.dashboardNavigation==nil,"event not consumed")
   let masks:Set<String>=[archived.id,active.id]
   check(!CompactVisibility.isVisible(archived,scope:.follow,hiddenIDs:masks),"hidden old render remains in follow")
-  check(CompactVisibility.isVisible(archived,scope:.all,hiddenIDs:masks) && !CompactVisibility.isVisible(archived,scope:.archived,hiddenIDs:masks),"masked terminal must stay hidden from Archives until restored")
-  check(CompactVisibility.isVisible(archived,scope:.archived,hiddenIDs:[]),"global restore must recover the archive")
+  check(CompactVisibility.isVisible(archived,scope:.all,hiddenIDs:masks) && !CompactVisibility.isVisible(archived,scope:.archived,hiddenIDs:masks),"hidden archive must remain visible only in All")
+  guard let restoredMasks=CompactVisibility.toggledHiddenIDs(for:archived,hiddenIDs:masks) else {preconditionFailure("archive visibility cannot be restored")}
+  check(!restoredMasks.contains(archived.id) && restoredMasks.contains(active.id) && CompactVisibility.isVisible(archived,scope:.archived,hiddenIDs:restoredMasks),"restoring archive visibility loses IDs or leaves archive hidden")
   check(CompactVisibility.isProtected(active) && CompactVisibility.isVisible(active,scope:.follow,hiddenIDs:masks),"fresh active masked from follow")
   var historical=active;historical.isFresh=false;historical.retainedHistorical=true
   check(!CompactVisibility.isProtected(historical),"historical job treated as live protected")
   check(jobs.filter(\.isArchived).count==2 && archived.archivedAt==Date(timeIntervalSince1970:1700000000),"route/mask modifies archive ID/date state")
+  var nativeHealth=SourceHealth();nativeHealth.online=true;nativeHealth.observedAt=Date()
+  var native=RenderDashboard.mac(MacJob(id:"native-F12",titre:"F12 complete",sous:nil,total:0,faites:0,en_cours:[],latest:[],times:[],proc:nil),health:nativeHealth,projectID:"native-project",workType:.image)
+  native.workID="native-work";native.nativeRenderOutcome="complete";native.archivedAt=Date()
+  // The real native-complete adapter uses the terminal activity without inventing counters.
+  var nativeObject=try JSONSerialization.jsonObject(with:JSONEncoder().encode(native)) as! [String:Any]
+  nativeObject["activity"]=RenderActivity.countsReached.rawValue
+  native=try JSONDecoder().decode(RenderDashboardJob.self,from:JSONSerialization.data(withJSONObject:nativeObject))
+  check(native.rawProgress==nil && !native.isTerminalCounted && native.isTerminalRender,"native completion fixture must not fabricate counters")
+  check(CatalogScope.archived.matches(native) && CatalogScope.dashboardScope(for:native) == .archived,"native complete archive must remain routable")
+  mini.openInDashboard(native,workID:"native-work")
+  guard let nativeRoute=mini.dashboardNavigation else {preconditionFailure("native archive route absent")}
+  check(nativeRoute.jobID==native.id && nativeRoute.projectID==native.projectID && nativeRoute.scope == .archived,"native archive navigation loses identity")
+  let nativeSnapshot=RenderCatalogSnapshot(revision:2,generatedAt:Date(),jobs:[native],projects:RenderDashboard.projects([native]),works:[RenderCatalogWork(id:"native-work",projectID:native.projectID,title:"native",workType:.image,jobs:[native])],knownJobCount:1,observedJobCount:1,stateCounts:RenderCatalogStateCounts(),persistenceIssue:nil)
+  dashboard.apply(nativeRoute);store.rebuild(nativeSnapshot,query:"",scope:nativeRoute.scope);dashboard.reconcile(store)
+  check(store.visibleJobIDs.contains(native.id) && dashboard.jobID==native.id,"native archive disappears after navigation/projection")
+  for outcome in ["unknown","cancel"] {
+   var nonterminal=native;nonterminal.nativeRenderOutcome=outcome
+   check(!nonterminal.isTerminalRender && !CatalogScope.archived.matches(nonterminal) && CatalogScope.dashboardScope(for:nonterminal)==nil,"unknown/cancel must not become terminal archives")
+  }
+  var oldFinished=archived;oldFinished.archivedAt=nil;oldFinished.isFresh=false;oldFinished.retainedHistorical=true
+  check(oldFinished.canArchive && oldFinished.isTerminalRender,"historical complete proof permits reversible archive without live PC")
+  oldFinished.archivedAt=Date()
+  check(!oldFinished.canArchive && CatalogScope.archived.matches(oldFinished),"historical archived state remains distinct")
+  oldFinished.archivedAt=nil
+  mini.openInDashboard(oldFinished,workID:"same-work")
+  guard let restoredRoute=mini.dashboardNavigation else {preconditionFailure("restored historical route absent")}
+  check(restoredRoute.scope == .finished && restoredRoute.jobID==oldFinished.id,"restored historical terminal must route to exact done identity")
+  var oldNative=native;oldNative.archivedAt=nil;oldNative.isFresh=false;oldNative.retainedHistorical=true
+  check(oldNative.canArchive && !oldNative.isTerminalCounted,"historical native complete archives without manufactured totals")
+  oldNative.nativeRenderOutcome=nil
+  check(!oldNative.canArchive,"historical unknown cannot be falsely completed")
+  check(!active.canArchive,"active remains protected from historical removal flow")
+  var contradictory=active;contradictory.nativeRenderOutcome="complete"
+  check(!contradictory.canArchive,"running activity plus stale completion token cannot be archived")
   print("ArchiveDashboardRouteTests: \(checks) assertions PASS; two isolated defaults namespaces; projection contract tested, native filter-reset/geometry NOT tested")
  }
 }

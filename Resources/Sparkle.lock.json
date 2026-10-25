@@ -1,0 +1,10 @@
+{
+  "version": "2.10.0",
+  "url": "https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz",
+  "sha256": "c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c",
+  "source_tag": "https://github.com/sparkle-project/Sparkle/tree/2.10.0",
+  "framework_inventory_sha256": "9212ccf0e5c6c3e138495e881d28d7a3bd707b6a7a82171bb911033b5d9ad8a9",
+  "framework_inventory_entries": 151,
+  "sign_update_sha256": "43c249771bafc3aa581228abae00731a012d324691b8292860896635050be76b",
+  "generate_appcast_sha256": "59e48e8432433cf4358519027e67e2c66a7348e0fe415f75f67b3b2372c13844"
+}

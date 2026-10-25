@@ -121,18 +121,25 @@ struct RenderConfigStore {
         let data=try JSONSerialization.data(withJSONObject:document,options:[.prettyPrinted,.sortedKeys])
         try checkpoint(permit)
         if data==before { return config }
+        // Preserve at most two distinct existing return points; never rotate/delete an old backup here.
+        let backups=try FileManager.default.contentsOfDirectory(at:root,includingPropertiesForKeys:nil).filter{$0.lastPathComponent.hasPrefix("config.before-preference-change-") && $0.pathExtension=="json"}
+        let duplicate=try before.map { prior in try backups.prefix(2).contains { file in
+            try checkpoint(permit)
+            return (try? RenderRegularFile.read(file,maximumBytes:8*1024*1024,permit:permit,allowSymlink:false))==prior
+        }} ?? false
+        let publishBackup=before != nil && backups.count<2 && !duplicate
         // Stage all data privately; no backup publication or target rename before the final guard.
         let temporary=root.appendingPathComponent("config.transaction-"+UUID().uuidString+".tmp")
         let pendingBackup=root.appendingPathComponent("config.backup-pending-"+UUID().uuidString+".tmp")
         defer { try? FileManager.default.removeItem(at:temporary);try? FileManager.default.removeItem(at:pendingBackup) }
         try checkpoint(permit);try data.write(to:temporary,options:.withoutOverwriting)
         try checkpoint(permit);try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:temporary.path)
-        if let before {
+        if let before,publishBackup {
             try checkpoint(permit);try before.write(to:pendingBackup,options:.withoutOverwriting)
             try checkpoint(permit);try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:pendingBackup.path)
         }
         try checkpoint(permit)
-        if before != nil {
+        if publishBackup {
             let backup=root.appendingPathComponent("config.before-preference-change-"+UUID().uuidString+".json")
             try checkpoint(permit)
             guard rename(pendingBackup.path,backup.path)==0 else { throw POSIXError(POSIXErrorCode(rawValue:errno) ?? .EIO) }

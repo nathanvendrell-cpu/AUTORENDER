@@ -116,8 +116,6 @@ final class UIHarness50Delegate: NSObject, NSApplicationDelegate {
                 sous: "Fixture UI neutre : aucune scène ni donnée client", total: 240, faites: count, en_cours: [], latest: [], times: times,
                 proc: process, workType: type, projectID: project)
             var view = RenderDashboard.mac(raw, health: health, projectID: project, workType: type)
-            // Harness-only simulated qualification; never inferred from actual legacy API process counts.
-            view.taskQualification = active ? .nativeRenderCommand : nil
             if !video {
                 view = RenderDashboardJob(id: view.id, title: view.title, projectID: project, source: .macFolder, workType: type,
                     rawCount: 1, postCount: nil, rawProgress: nil, postProgress: nil, totalProvenance: nil, activity: .unknown,

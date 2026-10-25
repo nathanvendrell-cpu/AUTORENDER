@@ -21,6 +21,8 @@ struct ShadowRunEnvelope: Codable {
     let partial:Bool
     let runs:[ShadowObservedRun]
     var automaticSources:[ShadowAutomaticSource]? = nil
+    var processSnapshot:ShadowProcessSnapshot? = nil
+    var sourceErrors:[String]? = nil
 }
 struct ShadowAutomaticSource:Codable {
     let source:ShadowDeclaredSource
@@ -147,6 +149,9 @@ struct ShadowObservedRun: Codable {
         job.contextProvenance=job.stageDescription ?? "Source déclarée"
         job.openTargets=[rawRoot,postRoot].map { root in RenderFolderTarget(id:Self.hash(root),title:root==rawRoot ? "Images brutes" : "Images post",location:nil,remoteDisplay:root,isVerified:fresh,verifiedAt:fresh ? RenderDate.parseOptional(observedAt) : nil) }
         job.latestOutput=entries.first
+        job.libraryStartedAtRaw=running ? claims.sorted{RenderDate.parse($0.birth)<RenderDate.parse($1.birth)}.first?.birth:nil
+        job.renderStartedAt=running ? claims.compactMap{RenderDate.parseOptional($0.birth)}.min():nil
+        if historicalTerminal {job.finalOutputProof = .scriptFinalContract;job.outputExpectedCount=total;job.outputAvailability = .fileAttested}
         return job
     }
 }

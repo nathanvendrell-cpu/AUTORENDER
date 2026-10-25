@@ -27,10 +27,15 @@ import Foundation
         let initial = try Data(contentsOf:configFile)
         let one = root.appendingPathComponent("one.json"); let two = root.appendingPathComponent("two.json")
         let registry = root.appendingPathComponent("registry.json")
-        try write([],one)
-        try fm.createSymbolicLink(at:registry,withDestinationURL:one)
         let worker = MacMonitorRegistryWorker()
         var result = await worker.reconcile(registry:registry,store:store,writable:true)
+        let absent:Bool
+        if case .confirmedAbsent = result.availability {absent=true} else {absent=false}
+        check(absent && result.issue==nil && result.folders==nil && result.config==nil,"fresh optional absence creates error or clears associations")
+        check(try !fm.fileExists(atPath:registry.path) && Data(contentsOf:configFile)==initial && backups(storeRoot)==0,"absent optional registry creates a file or writes preferences")
+        try write([],one)
+        try fm.createSymbolicLink(at:registry,withDestinationURL:one)
+        result = await worker.reconcile(registry:registry,store:store,writable:true)
         check(result.folders == [:] && result.added.isEmpty,"empty registry incorrect")
         check(try Data(contentsOf:configFile) == initial && backups(storeRoot) == 0,"unchanged cycle changes bytes/backups")
         try write([["id":"arrived","dossier":a.path]],one)
@@ -94,6 +99,27 @@ import Foundation
         result = await worker.reconcile(registry:registry,store:store,writable:false)
         check(result.folders?["ok"] == a.path && result.config == nil,"read-only mapping needs config write")
         check(try Data(contentsOf:configFile) == initial,"read-only discovery writes configuration")
+        // A known registry disappearing never becomes an optional absence.
+        try fm.removeItem(at:registry)
+        result = await worker.reconcile(registry:registry,store:store,writable:true)
+        let missingKnown:Bool
+        if case .unavailable = result.availability {missingKnown=true} else {missingKnown=false}
+        check(missingKnown && result.issue != nil && result.folders==nil && result.config==nil,"known registry disappearance clears associations or becomes safe optional absence")
+        check(try Data(contentsOf:configFile)==initial,"known registry disappearance changes preferences")
+        let broken=root.appendingPathComponent("broken-registry")
+        try fm.createSymbolicLink(at:broken,withDestinationURL:root.appendingPathComponent("not-created"))
+        let brokenWorker=MacMonitorRegistryWorker()
+        result=await brokenWorker.reconcile(registry:broken,store:store,writable:true)
+        check(result.issue != nil && result.registryWasPresent && result.folders==nil,"broken registry link treated as optional absence")
+        try fm.removeItem(at:broken)
+        result=await brokenWorker.reconcile(registry:broken,store:store,writable:true)
+        check(result.issue != nil && result.folders==nil,"removing previously broken registry loses known presence")
+        let unreadable=root.appendingPathComponent("unreadable-registry")
+        try write([],unreadable);try fm.setAttributes([.posixPermissions:0o000],ofItemAtPath:unreadable.path)
+        let unreadableWorker=MacMonitorRegistryWorker()
+        result=await unreadableWorker.reconcile(registry:unreadable,store:store,writable:true)
+        try fm.setAttributes([.posixPermissions:0o600],ofItemAtPath:unreadable.path)
+        check(result.issue != nil && result.folders==nil && result.registryWasPresent,"permission failure proves optional absence")
         print("MacMonitorRegistryTests: \(checks) assertions PASS; isolated filesystem fixtures; no renderer/provider/UI")
     }
 }

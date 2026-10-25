@@ -1,6 +1,6 @@
 import SwiftUI
 struct CompactCatalogJobRow: View {
-    let model: MonitorModel
+    @ObservedObject var model: MonitorModel
     let archivePreferred: Bool
     let job: RenderDashboardJob
     let selected: Bool
@@ -10,9 +10,24 @@ struct CompactCatalogJobRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 12) {
-                Button(action: onOpen) { CompactCatalogIndicator(job: job) }
-                    .buttonStyle(.plain).help("Afficher le détail").accessibilityLabel("Afficher le détail de " + job.title)
-                    .accessibilityValue((job.rawProgress?.percentLabel ?? "Progression indéterminée") + ", " + remainingLabel)
+                VStack(spacing: 4) {
+                    Button(action: onOpen) { CompactCatalogIndicator(job: job) }
+                        .buttonStyle(.plain).help("Afficher le détail").accessibilityLabel("Afficher le détail de " + job.title)
+                        .accessibilityValue((job.rawProgress?.percentLabel ?? "Progression indéterminée") + ", " + remainingLabel)
+                    if let entry = compactPreviewEntry {
+                        Group {
+                            if let image = model.thumbnail(for: entry) {
+                                Image(nsImage: image).resizable().scaledToFit()
+                            } else {
+                                Text(model.previewStatus(for: entry).label)
+                                    .font(.system(size: 8)).foregroundStyle(RenderStyle.secondary)
+                            }
+                        }.frame(width: 72, height: 40)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                            .help("Dernière image terminée · " + entry.filename)
+                            .accessibilityLabel("Aperçu de la dernière image terminée : " + entry.filename)
+                    }
+                }
                 VStack(alignment: .leading, spacing: 4) {
                     CatalogFolderName(name: job.versionLabel ?? job.title, targets: job.openTargets)
                         .font(.system(size: 13, weight: .semibold)).lineLimit(2)
@@ -32,8 +47,11 @@ struct CompactCatalogJobRow: View {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(remainingLabel).font(.system(size: 11)).foregroundStyle(RenderStyle.secondary)
-                    if let cadence = job.historicalMedianSeconds, cadence.isFinite, cadence >= 0 {
-                        Text(String(format: "Cadence historique · %.0f s / sortie", cadence)).font(.system(size: 10)).foregroundStyle(RenderStyle.secondary)
+                    if let timing = job.nativeFrameTiming, timing.sampleCount > 0,
+                       timing.meanSeconds.isFinite, timing.meanSeconds > 0 {
+                        Text("Vitesse · " + secondsLabel(timing.meanSeconds) + " s/image")
+                            .font(.system(size: 10)).foregroundStyle(RenderStyle.secondary)
+                            .monospacedDigit().help(timingHelp(timing))
                     }
                 }
                 Spacer(minLength: 8)
@@ -48,6 +66,31 @@ struct CompactCatalogJobRow: View {
             .background(selected ? RenderStyle.blue.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 12)).renderGlass(radius: 12, shadow: 2)
             .accessibilityElement(children: .contain)
             .contextMenu { rowActions }
+            .task(id: compactPreviewRequestID) {
+                model.setCompactPreview(compactPreviewEntry, forJobID: job.id)
+            }
+            .onDisappear { model.setCompactPreview(nil, forJobID: job.id) }
+    }
+    private var compactPreviewEntry: RenderEntry? {
+        job.previewEntries.filter {
+            $0.source == .macFolder && $0.monitorJobID == job.id &&
+            $0.localPreviewProof?.jobID == job.id && $0.state != .pending &&
+            ($0.filename as NSString).pathExtension.lowercased() == "png"
+        }.max { $0.modified < $1.modified }
+    }
+    private var compactPreviewRequestID: String {
+        job.id + "|" + String(model.compactPreviewVisible) + "|" +
+            RenderPreviewRequest.fingerprint(entries: compactPreviewEntry.map { [$0] } ?? [])
+    }
+    private func secondsLabel(_ seconds: Double) -> String {
+        String(format: "%.1f", locale: Locale(identifier: "fr_FR"), seconds)
+    }
+    private func timingHelp(_ timing: RenderFrameTiming) -> String {
+        var label = "Moyenne sur \(timing.sampleCount) images · " + timing.provenance
+        if let latest = timing.latestSeconds, latest.isFinite, latest > 0 {
+            label += " · Dernière image vérifiée : " + secondsLabel(latest) + " s"
+        }
+        return label
     }
     @ViewBuilder private var rowActions: some View {
         Button("Ouvrir dans le dashboard", action: onOpen)

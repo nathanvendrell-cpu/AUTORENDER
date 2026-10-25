@@ -4,9 +4,7 @@ import Foundation
     static func check(_ value:@autoclosure()->Bool,_ message:String) { count += 1;precondition(value(),message) }
     static func job(_ id:String,done:Int,total:Int,process:Bool=false)->RenderDashboardJob {
         var h=SourceHealth();h.online=true;h.observedAt=Date()
-        var job=RenderDashboard.mac(MacJob(id:id,titre:"Neutral",sous:nil,total:total,faites:done,en_cours:[],latest:[],times:[],proc:process ? MacProcess(cpu:"1",ram_mo:1,duree:"00:01") : nil),health:h,projectID:"project",workType:nil)
-        job.taskQualification=process ? .nativeRenderCommand:nil // SIMULATED reactivation evidence.
-        return job
+        return RenderDashboard.mac(MacJob(id:id,titre:"Neutral",sous:nil,total:total,faites:done,en_cours:[],latest:[],times:[],proc:process ? MacProcess(cpu:"1",ram_mo:1,duree:"00:01") : nil),health:h,projectID:"project",workType:nil)
     }
     static func shadow(post:Int?,total:Int?)->RenderDashboardJob {
         let data=try! JSONSerialization.data(withJSONObject:["ok":true,"brut":10,"post":post as Any? ?? NSNull(),"total":total as Any? ?? NSNull(),"blender":0])

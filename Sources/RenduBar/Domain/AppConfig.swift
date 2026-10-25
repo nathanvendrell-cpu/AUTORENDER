@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 
 struct AppConfig: Codable {
+    var shadowMonitoringEnabled=true
     var macFolders: [String] = []
     var shadowFolders: [String] = []
     var dismissedMacFolders: [String] = []
@@ -12,11 +13,15 @@ struct AppConfig: Codable {
     var jobContexts: [String: RenderJobContext] = [:]
     var remoteMirrors: [String: String] = [:]
     var jobArchives: [String:Date] = [:]
+    var nativeJobReceipts:[NativeJobReceiptBinding]? = nil
     var nativeMetadataSources:[String:NativeMetadataSourceConfig] = [:]
     var shadowRunSources:[ShadowDeclaredSource] = []
+    var projectBindings:[RenderProjectBinding]? = nil
+    var contextRules:[RenderContextRule]? = nil
+    var librarySettings:RenderLibrarySettings? = nil
     var archivePayloadError: String? = nil
 
-    private enum CodingKeys: String, CodingKey { case macFolders, shadowFolders, dismissedMacFolders, folderProjects, folderWorkTypes, dashboardProjectLinks, dashboardJobFolders, jobContexts, remoteMirrors, jobArchives, nativeMetadataSources, shadowRunSources }
+    private enum CodingKeys: String, CodingKey { case shadowMonitoringEnabled, nativeJobReceipts, macFolders, shadowFolders, dismissedMacFolders, folderProjects, folderWorkTypes, dashboardProjectLinks, dashboardJobFolders, jobContexts, remoteMirrors, jobArchives, nativeMetadataSources, shadowRunSources, librarySettings, contextRules, projectBindings }
 
     init(macFolders: [String] = [], shadowFolders: [String] = [], dismissedMacFolders: [String] = [],
          folderProjects: [String: String] = [:], folderWorkTypes: [String: RenderWorkType] = [:], dashboardProjectLinks: [String: String] = [:], dashboardJobFolders: [String: [String]] = [:], jobContexts: [String: RenderJobContext] = [:], remoteMirrors: [String:String] = [:], jobArchives: [String:Date] = [:]) {
@@ -34,6 +39,11 @@ struct AppConfig: Codable {
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        shadowMonitoringEnabled = (try? values.decode(Bool.self,forKey:.shadowMonitoringEnabled)) ?? true
+        nativeJobReceipts = try? values.decode([NativeJobReceiptBinding].self,forKey:.nativeJobReceipts)
+        projectBindings = try? values.decode([RenderProjectBinding].self,forKey:.projectBindings)
+        contextRules = try? values.decode([RenderContextRule].self,forKey:.contextRules)
+        librarySettings = try? values.decode(RenderLibrarySettings.self,forKey:.librarySettings)
         shadowRunSources = try values.decodeIfPresent([ShadowDeclaredSource].self,forKey:.shadowRunSources) ?? []
         macFolders = try values.decodeIfPresent([String].self, forKey: .macFolders) ?? []
         shadowFolders = try values.decodeIfPresent([String].self, forKey: .shadowFolders) ?? []
@@ -56,6 +66,11 @@ struct AppConfig: Codable {
 
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(shadowMonitoringEnabled,forKey:.shadowMonitoringEnabled)
+        try values.encodeIfPresent(nativeJobReceipts,forKey:.nativeJobReceipts)
+        try values.encodeIfPresent(projectBindings,forKey:.projectBindings)
+        try values.encodeIfPresent(contextRules,forKey:.contextRules)
+        try values.encodeIfPresent(librarySettings,forKey:.librarySettings)
         try values.encode(shadowRunSources,forKey:.shadowRunSources)
         try values.encode(macFolders, forKey: .macFolders)
         try values.encode(shadowFolders, forKey: .shadowFolders)
@@ -139,6 +154,12 @@ struct AppConfig: Codable {
 
 struct RenderJobContext: Codable, Equatable {
     var projectID: String?
+    var projectTitle:String?=nil
+    var subprojectID:String?=nil
+    var subprojectTitle:String?=nil
+    var sceneID:String?=nil
+    var sceneTitle:String?=nil
+    var libraryVersion:String?=nil
     var workID: String?
     var versionID: String?
     var workTitle: String?

@@ -53,6 +53,14 @@ enum RenderWorkType: String, Codable, CaseIterable {
     }
 }
 
+struct RenderLocalPreviewProof:Codable,Equatable {
+    let jobID:String
+    let sha256:String
+    let stamp:RenderLibraryFileStamp
+    let changedSeconds:Int64
+    let changedNanoseconds:Int64
+}
+
 struct RenderEntry: Identifiable, Codable, Equatable {
     let id: String
     let source: RenderSource
@@ -63,6 +71,7 @@ struct RenderEntry: Identifiable, Codable, Equatable {
     let path: String?
     let previewURL: String?
     var monitorJobID: String? = nil
+    var localPreviewProof:RenderLocalPreviewProof?=nil
 
     var fileMediaType: RenderKind { RenderKind.classify(filename) }
     var kind: RenderKind { RenderKind.classify(filename) }

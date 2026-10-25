@@ -41,6 +41,8 @@ struct RenderCatalogSnapshot {
     let stateCounts: RenderCatalogStateCounts
     let persistenceIssue: String?
     var reactivatedArchiveIDs: [String] = []
+    var historyRevision:UInt64=0
+    var libraryJobs:[RenderDashboardJob]=[]
     static let empty = RenderCatalogSnapshot(revision: 0, generatedAt: .distantPast, jobs: [], projects: [], works: [],
         knownJobCount: 0, observedJobCount: 0, stateCounts: RenderCatalogStateCounts(), persistenceIssue: nil)
 }

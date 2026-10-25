@@ -3,11 +3,16 @@ import SwiftUI
 struct MenuSummaryView: View {
     @ObservedObject var model: MonitorModel
     let detached: Bool
+    let loginItems: LoginItemController?
     let openOverview: () -> Void
     let detach: () -> Void
+    let openSection: (CatalogScope) -> Void
+    let openLibrary: () -> Void
     @StateObject private var selection: CatalogSelectionController
     private var jobID: String { selection.jobID }
-    init(model: MonitorModel, detached: Bool, openOverview: @escaping () -> Void, detach: @escaping () -> Void, selectionDefaults: UserDefaults = .standard) {
+    init(model: MonitorModel, detached: Bool, loginItems: LoginItemController? = nil, openOverview: @escaping () -> Void, detach: @escaping () -> Void, openSection: @escaping (CatalogScope) -> Void = { _ in }, openLibrary: @escaping () -> Void = {}, selectionDefaults: UserDefaults = .standard) {
+        self.openSection = openSection; self.openLibrary = openLibrary
+        self.loginItems = loginItems
         self.model = model; self.detached = detached; self.openOverview = openOverview; self.detach = detach
         _selection = StateObject(wrappedValue: CatalogSelectionController(defaults: selectionDefaults))
     }
@@ -15,7 +20,10 @@ struct MenuSummaryView: View {
     @State private var hiddenIDs = Set<String>()
     @State private var listError = ""
     @State private var query = ""
-    @State private var scope: CatalogScope = .direct
+    private let scope: CatalogScope = .direct
+    @State private var activePage = 0
+    @State private var activeProjectionRevision: UInt64 = 0
+    @State private var emptyStateMessage = "Observation en attente."
     @State private var sections: [CatalogSection] = []
     @State private var activeCount = 0
     @State private var finishedCount = 0
@@ -50,23 +58,19 @@ struct MenuSummaryView: View {
                 Spacer()
             }
             HStack {
-                TextField("Rechercher projet, travail ou version", text: $query).textFieldStyle(.roundedBorder)
-                Picker("Afficher", selection: $scope) {
-                    ForEach(CatalogScope.mainSections, id: \.self) { Text($0.rawValue).tag($0) }
-                }.pickerStyle(.menu).labelsHidden()
-            }
-            HStack {
-                Button("Archiver \(eligibleCount) terminés") { model.archiveCompletedJobs() }
-                    .buttonStyle(.bordered).disabled(eligibleCount == 0)
-                    .help("Archive les rendus dont la fin est établie. Aucun fichier n’est supprimé.")
+                Button("Rendus faits (\(finishedCount))") { openSection(.finished) }.buttonStyle(.bordered)
+                if model.config.librarySettings == nil { Button("Configurer", action: openLibrary).buttonStyle(.bordered) }
                 Spacer()
                 Menu("Options") {
-                    Button("Voir les archives (\(archivedCount))") { query = ""; scope = .archived }
-                    Button("Voir les rendus terminés") { query = ""; scope = .finished }
+                    if let loginItems { LoginItemMenu(controller: loginItems); Divider() }
+                    Button("Archives (\(archivedCount))") { openSection(.archived) }
+                    Button("Rendus faits") { openSection(.finished) }
+                    Button("Bibliothèque et réglages", action: openLibrary)
+                    Button("À classer") { openSection(.unclassified) }
                     Button("Sources suivies") { showSources = true }
                     Divider()
                     Button("Réafficher les rendus masqués (\(hiddenIDs.count))") { hiddenIDs.removeAll(); saveHiddenIDs() }.disabled(hiddenIDs.isEmpty)
-                    Button("Restaurer toutes les archives") { model.restoreAllArchivedJobs() }.disabled(model.config.jobArchives.isEmpty)
+
                 }.menuStyle(.borderlessButton)
 
             }.font(.system(size: 11))
@@ -88,12 +92,12 @@ struct MenuSummaryView: View {
                     }
                     if displayedCount == 0 {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text(query.isEmpty && scope == .direct ? "Aucun rendu actif détecté. Les rendus terminés restent accessibles dans leur section." : "Aucun rendu pour ce filtre.")
+                            Text(emptyStateMessage)
                                 .font(.system(size: 12)).foregroundStyle(RenderStyle.secondary)
-                            Text("Dernier relevé : " + (model.catalogSnapshot.jobs.compactMap(\.observedAt).max()?.formatted(date: .abbreviated, time: .shortened) ?? "indisponible"))
+                            Text("Dernier relevé : " + (model.activeRenderJobs.compactMap(\.observedAt).max()?.formatted(date: .abbreviated, time: .shortened) ?? "indisponible"))
                                 .font(.system(size: 10)).foregroundStyle(RenderStyle.secondary)
                             HStack {
-                                Button("Voir les rendus terminés") { query = ""; scope = .finished }.buttonStyle(.bordered)
+                                Button("Rendus faits") { openSection(.finished) }.buttonStyle(.bordered)
                                 Button("Sources suivies") { showSources = true }.buttonStyle(.bordered)
                             }
                         }.padding(.vertical, 20)
@@ -105,19 +109,25 @@ struct MenuSummaryView: View {
                     .font(.system(size: 10)).foregroundStyle(.orange)
             }
             HStack {
-                Text("\(displayedCount) affichés · \(scope.rawValue)")
+                Text("\(min(activePage * 100 + 1, displayedCount))–\(min((activePage + 1) * 100, displayedCount)) / \(displayedCount) actifs")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
+                if displayedCount > 100 {
+                    Button("Précédent") { activePage -= 1 }.disabled(activePage == 0)
+                    Button("Suivant") { activePage += 1 }.disabled((activePage + 1) * 100 >= displayedCount)
+                }
                 Button("Vue générale", action: openOverview).buttonStyle(.bordered)
             }
         }.padding(14).frame(minWidth: 480, maxWidth: 740, minHeight: 340, maxHeight: .infinity)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .renderWindowSurface()
-            .onAppear { loadHiddenIDs(); projectRows() }
+            .onAppear { loadHiddenIDs(); refreshHistoricalCounts(); projectRows() }
             .onChange(of: hiddenIDsJSON) { loadHiddenIDs(); projectRows() }
             .onChange(of: model.catalogSnapshot.revision) { projectRows() }
+            .onChange(of: model.observationRevision) { projectRows() }
             .onChange(of: query) { projectRows() }
-            .onChange(of: scope) { projectRows() }
+            .onChange(of: activePage) { projectRows() }
+            .onChange(of: model.historyRevision) { refreshHistoricalCounts() }
             .sheet(isPresented: $showSources) { SourcesView(model: model) }
     }
 
@@ -143,26 +153,33 @@ struct MenuSummaryView: View {
             Text(title)
         }.font(.system(size: 10))
     }
+    private func refreshHistoricalCounts() {
+        finishedCount = model.catalogSnapshot.jobs.filter(\.isFinishedRender).count
+        archivedCount = model.catalogSnapshot.archivedJobCount
+    }
     private func projectRows() {
         #if AUTORENDER_UI_HARNESS
         let projectionStart = ProcessInfo.processInfo.systemUptime
         defer { UIHarness50Metrics.recordProjection(known: knownCount, displayed: displayedCount,
             seconds: ProcessInfo.processInfo.systemUptime - projectionStart) }
         #endif
-        let snapshot = model.catalogSnapshot
-        let jobs = snapshot.jobs
-        knownCount = snapshot.knownJobCount
-        activeCount = jobs.filter { CatalogScope.direct.matches($0) }.count
-        finishedCount = jobs.filter { CatalogScope.finished.matches($0) }.count
-        archivedCount = snapshot.archivedJobCount
-        eligibleCount = jobs.filter(\.canArchive).count
-        presentation.rebuild(snapshot, query: query, scope: scope)
+        activeProjectionRevision &+= 1
+        let snapshot = CatalogProjectionSnapshot.active(model.activeRenderJobs, revision: activeProjectionRevision)
+        switch model.menuBarObservation(at: Date()) {
+        case .confirmed: emptyStateMessage = "Aucun rendu actif détecté sur les sources suivies. Les rendus faits restent dans leur section."
+        case .refreshing: emptyStateMessage = "Actualisation en cours. L’absence de rendu n’est pas encore confirmée."
+        case .uncertain: emptyStateMessage = "Activité incertaine. La connexion ou le relevé doit être confirmé."
+        }
+        knownCount = model.catalogSnapshot.knownJobCount
+        presentation.rebuild(snapshot, query: "", scope: .direct)
+        let all = presentation.sections.flatMap(\.jobs)
+        activeCount = all.count; displayedCount = all.count
+        activePage = min(activePage, max(0, (all.count - 1) / 100))
+        let ids = Set(all.dropFirst(activePage * 100).prefix(100).map(\.id))
         sections = presentation.sections.compactMap { section in
-            let visible = section.jobs.filter { CompactVisibility.isVisible($0, scope: scope, hiddenIDs: hiddenIDs) }
+            let visible = section.jobs.filter { ids.contains($0.id) }
             return visible.isEmpty ? nil : CatalogSection(id: section.id, title: section.title, jobs: visible)
         }
-        displayedCount = sections.reduce(0) { $0 + $1.jobs.count }
-        if scope == .direct { activeCount = displayedCount }
 
 
     }
@@ -184,5 +201,22 @@ enum CompactVisibility {
     }
     static func isVisible(_ job: RenderDashboardJob, scope: CatalogScope, hiddenIDs: Set<String>) -> Bool {
         isProtected(job) || scope == .all || !hiddenIDs.contains(job.id)
+    }
+}
+
+private struct LoginItemMenu: View {
+    @ObservedObject var controller: LoginItemController
+    var body: some View {
+        Text(controller.label)
+        if let error = controller.error { Text(error) }
+        if controller.state == .enabled {
+            Button("Désactiver à l’ouverture de session") { controller.disable() }.disabled(!controller.mayRegister)
+        } else if controller.state == .requiresApproval {
+            Button("Autoriser dans Réglages Système…") { controller.openSettings() }
+            Button("Annuler la demande") { controller.disable() }.disabled(!controller.mayRegister)
+        } else {
+            Button("Activer à l’ouverture de session") { controller.enable() }
+                .disabled(!controller.mayRegister || controller.state == .unavailable)
+        }
     }
 }

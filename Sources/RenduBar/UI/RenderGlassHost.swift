@@ -10,7 +10,7 @@ extension EnvironmentValues {
 }
 
 private struct RenderWindowSurface: ViewModifier {
-    @State private var focused = true
+    @State private var focused = false
     func body(content: Content) -> some View {
         content.foregroundStyle(RenderStyle.ink).tint(RenderStyle.blue)
             .preferredColorScheme(.light)
@@ -27,18 +27,20 @@ private struct RenderWindowBackdrop: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
         Group {
-            if reduceTransparency { shape.fill(RenderStyle.paper) }
-            else if #available(macOS 26, *) {
-                if focused {
-                    shape.fill(.white.opacity(0.66))
-                        .glassEffect(.clear.tint(.white.opacity(0.16)), in: shape)
-                } else {
-                    shape.fill(.white.opacity(0.72))
-                        .glassEffect(.regular.tint(.white.opacity(0.16)), in: shape)
-                        .overlay { shape.strokeBorder(.white.opacity(0.24), lineWidth: 0.7).allowsHitTesting(false) }
-                }
+            if RenderWindowFocusPolicy.opaqueBackground(focused: focused, reduceTransparency: reduceTransparency) {
+                // Keep an alpha-1 foundation under the glass: focus must improve readability.
+                shape.fill(RenderStyle.paper)
+                    .overlay {
+                        if #available(macOS 26, *), !reduceTransparency {
+                            shape.fill(.clear).glassEffect(.regular.tint(.white.opacity(0.16)), in: shape)
+                        }
+                    }
+                    .overlay { shape.strokeBorder(.white.opacity(0.24), lineWidth: 0.7).allowsHitTesting(false) }
+            } else if #available(macOS 26, *) {
+                shape.fill(.white.opacity(0.16))
+                    .glassEffect(.clear.tint(.white.opacity(0.12)), in: shape)
             } else {
-                RenderLegacyBackdrop().overlay(.white.opacity(focused ? 0.16 : 0.28)).clipShape(shape)
+                RenderLegacyBackdrop().overlay(.white.opacity(0.16)).clipShape(shape)
             }
         }.allowsHitTesting(false)
             .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: focused)
@@ -50,7 +52,7 @@ private struct RenderLegacyBackdrop: NSViewRepresentable {
         let view = NSVisualEffectView()
         view.material = .underWindowBackground
         view.blendingMode = .behindWindow
-        view.state = .active
+        view.state = .followsWindowActiveState
         return view
     }
     func updateNSView(_ view: NSVisualEffectView, context: Context) {}
@@ -103,7 +105,8 @@ private struct RenderFocusProbe: NSViewRepresentable {
             super.viewDidMoveToWindow()
             clearObservers()
             guard let window else { return }
-            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+                         NSWindow.didBecomeMainNotification, NSWindow.didResignMainNotification] {
                 observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in self?.refresh() })
             }
             for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
@@ -112,7 +115,8 @@ private struct RenderFocusProbe: NSViewRepresentable {
             refresh()
         }
         private func refresh() {
-            let active = window?.isKeyWindow == true && NSApp.isActive
+            let active = RenderWindowFocusPolicy.focused(applicationActive: NSApp.isActive,
+                keyWindow: window?.isKeyWindow == true, mainWindow: window?.isMainWindow == true)
             guard active != last else { return }
             last = active
             DispatchQueue.main.async { [weak self] in self?.changed?(active) }

@@ -9,6 +9,8 @@ struct NativeRenderDiscoveryResult {
 
 private final class NativeRenderDiscoveryEngine {
     private let reader: any NativeProcessReading
+    private let receipts=NativeJobReceiptReader()
+    private var receiptPrevious:[String:(Int,Date)]=[:]
     private let scripts:any NativeScriptContractReading
     private struct FinishScope {
         var observation:NativeRenderObservation
@@ -16,13 +18,16 @@ private final class NativeRenderDiscoveryEngine {
         var sample:NativePlannedFrameMetadata.Sample?
         var readsAfterExit=0
     }
+    private struct DirectFinish {var observation:NativeRenderObservation;let descriptor:NativeScriptDescriptor;var stamp:NativePlannedFrameMetadata.Fingerprint?;var reads=0}
+    private var directFinish:[String:DirectFinish]=[:]
     private var finishScopes:[String:FinishScope]=[:]
     private var plannedPrevious:[String:NativePlannedFrameMetadata.Sample]=[:]
     private var previous: [String:(run:String,count:Int,at:Date)] = [:]
     init(reader: any NativeProcessReading = NativeProcessReader(),scripts:any NativeScriptContractReading = NativeScriptContractReader()) { self.reader=reader;self.scripts=scripts }
 
-    func collect(store: RenderConfigStore, links: [String:[String]], writable: Bool, at: Date, permit:RenderIOPermit) throws -> NativeRenderDiscoveryResult {
+    func collect(store: RenderConfigStore, links: [String:[String]], writable: Bool, at: Date, permit:RenderIOPermit,historicalJobs:[RenderDashboardJob]) throws -> NativeRenderDiscoveryResult {
         try permit.check()
+        receipts.beginCollection()
         let sample=reader.read()
         try permit.check()
         var seen=Set<String>()
@@ -36,8 +41,23 @@ private final class NativeRenderDiscoveryEngine {
         let mappings=configured?.nativeMetadataSources ?? [:]
         if mappings.count>32 { mappingIssue=true }
         if mappings.values.contains(where:{ source in !observations.contains { $0.identity==source.processIdentity && $0.scene==source.scene } }) { mappingIssue=true }
+        var receiptValues:[String:NativeJobReceiptReader.Value]=[:]
+        var bindings=Array((configured?.nativeJobReceipts ?? []).prefix(64))
+        if let found=try? receipts.backfill(historicalJobs.filter{job in !bindings.contains{$0.identity.jobID==job.id}},now:at,permit:permit) {
+            for binding in found where !bindings.contains(where:{$0.identity==binding.identity}) {if bindings.count<64{bindings.append(binding)}}
+        }
+        let retainedBindings=Set(bindings.map{$0.identity})
+        for observation in observations {
+            guard let directory=observation.jobDirectory,let scene=observation.scene,let script=observation.script else{continue}
+            if let value=try? receipts.read(directory:directory,identity:observation.identity,scene:scene,renderer:script,now:at,binding:bindings.first(where:{$0.identity==observation.identity}),permit:permit) {
+                receiptValues[observation.id]=value
+                bindings.removeAll{$0.identity==observation.identity}
+                bindings.append(value.binding)
+                bindings=Array(bindings.sorted{$0.identity.bornAt>$1.identity.bornAt}.prefix(64))
+            }
+        }
         var automatic:[NativeProcessIdentity:NativeScriptDescriptor]=[:]
-        for observation in observations where observation.script != nil && observation.scene != nil && !mappings.values.contains(where:{$0.processIdentity==observation.identity}) {
+        for observation in observations where observation.script != nil && observation.scene != nil && receiptValues[observation.id]==nil && !mappings.values.contains(where:{$0.processIdentity==observation.identity}) {
             guard let snapshot=sample.snapshots.first(where:{$0.identity==observation.identity}) else{continue}
             do {
                 if let descriptor=try scripts.infer(snapshot,observation:observation,permit:permit) {automatic[observation.identity]=descriptor}
@@ -47,7 +67,7 @@ private final class NativeRenderDiscoveryEngine {
         for index in observations.indices {
             try permit.check()
             var observation=observations[index]
-            if observation.renderCommand,observation.scene != nil {
+            if observation.renderCommand {
                 observation.taskQualification = .nativeRenderCommand
             }
             // User interface can explicitly associate a candidate run with one local output root.
@@ -102,6 +122,18 @@ private final class NativeRenderDiscoveryEngine {
                 } else if matched.count>1 { mappingIssue=true;nextPlanned.removeValue(forKey:observation.id) }
             }
             if observation.runID == nil,let scene=observation.scene,let descriptor=automatic[observation.identity] {
+                if descriptor.isDirectRender {
+                    observation.taskQualification = .nativeProductionContract
+                    observation.declaredTotal=descriptor.descriptor.mode=="still" ? 1:nil
+                    observation.outputPattern=descriptor.descriptor.filenamePattern.isEmpty ? nil:descriptor.descriptor.filenamePattern
+                    observation.outputRoot=NativeRenderPaths.root(descriptor.descriptor.outputRoot)
+                    observation.workType=descriptor.descriptor.mode=="still" ? .image:.video
+                    observation.runID=descriptor.versionID
+                    observation.stage="Invocation de rendu directe dans le script · préparation ou calcul · processus corrélé"
+                    observation.progressProvenance="AST : invocation au premier niveau · compteur non mesuré"
+                    observations[index]=observation
+                    continue
+                }
                 let source=descriptor.mapping
                 let current=NativePlannedFrameMetadata.Binding(pid:observation.identity.pid,birthSeconds:observation.identity.birthSeconds,
                     birthMicroseconds:observation.identity.birthMicroseconds,executable:observation.identity.executable,scene:scene)
@@ -149,6 +181,7 @@ private final class NativeRenderDiscoveryEngine {
                 }
             }
             try permit.check()
+            if let value=receiptValues[observation.id] {value.apply(to:&observation,previous:receiptPrevious[observation.id])}
             observations[index]=observation
         }
         // Recheck the bounded same-user identity after filesystem IO before exposing or importing a root.
@@ -173,10 +206,57 @@ private final class NativeRenderDiscoveryEngine {
                 }
             }
         }
+        bindings=bindings.filter{binding in retainedBindings.contains(binding.identity) || observations.contains{$0.identity==binding.identity}}
+        // A qualified binding survives the producer process and app restart; no synthetic live task.
+        var receiptHistory:[NativeRenderObservation]=[]
+        if !sample.partial && sample.issue==nil && !fresh.partial && fresh.issue==nil {
+            for binding in bindings where !observations.contains(where:{$0.identity==binding.identity}) {
+                try permit.check()
+                if let value=try? receipts.read(binding:binding,now:at,permit:permit) {
+                    var history=NativeRenderObservation(identity:binding.identity,producer:"Blender",observedAt:at)
+                    history.processPresent=false;value.apply(to:&history);receiptHistory.append(history)
+                }
+            }
+        }
+        var nextDirect=directFinish
+        for observation in observations {
+            if let descriptor=automatic[observation.identity],descriptor.isDirectRender {
+                nextDirect[observation.id]=DirectFinish(observation:observation,descriptor:descriptor)
+            }
+        }
+        if nextDirect.count>64 {nextDirect=Dictionary(uniqueKeysWithValues:nextDirect.sorted{$0.value.observation.observedAt>$1.value.observation.observedAt}.prefix(64).map{($0.key,$0.value)})}
+        if !sample.partial && sample.issue==nil && !fresh.partial && fresh.issue==nil {
+            for id in Array(nextDirect.keys) where !observations.contains(where:{$0.id==id}) {
+                guard var scope=nextDirect[id] else{continue};try permit.check();scope.reads += 1
+                var history=scope.observation;history.processPresent=false;history.taskQualification=nil;history.metadataAdvanced=false
+                history.activityOverride = .resumeRequired;history.stage="Processus disparu · fin ou interruption non attestée"
+                if let path=history.outputPattern,scope.descriptor.descriptor.mode=="still",
+                   !observations.contains(where:{$0.outputPattern==path || ($0.script != nil && $0.outputRoot==nil)}),
+                   (try? scope.descriptor.matchesScript(history.script ?? "",permit:permit))==true {
+                    let fd=open(path,O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC)
+                    if fd>=0 {
+                        defer{close(fd)};var info=stat()
+                        if fstat(fd,&info)==0,(info.st_mode & S_IFMT)==S_IFREG,info.st_size>0,
+                           NativePlannedFrameMetadata.pngEnvelope(fd:fd,bytes:info.st_size) != nil {
+                            let stamp=NativePlannedFrameMetadata.Fingerprint(device:UInt64(info.st_dev),inode:UInt64(info.st_ino),bytes:info.st_size,modified:Date(timeIntervalSince1970:Double(info.st_mtimespec.tv_sec)+Double(info.st_mtimespec.tv_nsec)/1e9))
+                            if stamp.modified>=history.identity.bornAt,scope.stamp==stamp {
+                                history.completed=1;history.declaredTotal=1;history.stableOutputCountVerified=true
+                                history.activityOverride = .countsReached
+                                history.progressProvenance="Sortie PNG exacte, conteneur cohérent et stable sur deux lectures · processus absent · décodage pixels non attesté"
+                                history.stage="Image attendue stable comptée · fin technique, qualité et export final non attestés"
+                            }
+                            scope.stamp=stamp
+                        }
+                    }
+                }
+                receiptHistory.append(history)
+                if history.completed==1 || scope.reads>=2 {nextDirect.removeValue(forKey:id)} else{nextDirect[id]=scope}
+            }
+        }
         var nextFinish=finishScopes
         for observation in observations {
             guard let descriptor=automatic[observation.identity] else{continue}
-            if observation.taskQualification == .nativeProductionContract && observation.outputScopeIsExclusive {
+            if !descriptor.isDirectRender && observation.taskQualification == .nativeProductionContract && observation.outputScopeIsExclusive {
                 nextFinish[observation.id]=FinishScope(observation:observation,descriptor:descriptor,sample:nextPlanned[observation.id])
             } else {nextFinish.removeValue(forKey:observation.id)}
         }
@@ -184,7 +264,7 @@ private final class NativeRenderDiscoveryEngine {
             let keep=Set(nextFinish.values.sorted{$0.observation.observedAt>$1.observation.observedAt}.prefix(64).map{$0.observation.id})
             nextFinish=nextFinish.filter{keep.contains($0.key)}
         }
-        var historyObservations:[NativeRenderObservation]=[]
+        var historyObservations:[NativeRenderObservation]=receiptHistory
         let present=Set(observations.map(\.id))
         // Existing collection only: settle the last scoped outputs after a positively validated process absence.
         if !sample.partial && sample.issue==nil && !fresh.partial && fresh.issue==nil {
@@ -224,7 +304,8 @@ private final class NativeRenderDiscoveryEngine {
         nextPrevious=nextPrevious.filter { seen.contains($0.key) }
         func accept(_ result:NativeRenderDiscoveryResult) throws -> NativeRenderDiscoveryResult {
             try permit.check()
-            plannedPrevious=nextPlanned;previous=nextPrevious;finishScopes=nextFinish
+            plannedPrevious=nextPlanned;previous=nextPrevious;finishScopes=nextFinish;directFinish=nextDirect
+            receiptPrevious=Dictionary(uniqueKeysWithValues:receiptValues.map{($0.key,($0.value.completed,$0.value.at))})
             return result
         }
         var health=SourceHealth();health.online=sample.issue==nil || !observations.isEmpty
@@ -238,8 +319,8 @@ private final class NativeRenderDiscoveryEngine {
         try permit.check()
         guard writable else { return try accept(result) }
         let roots=Array(Set(observations.compactMap(\.outputRoot))).sorted()
-        guard !roots.isEmpty else { return try accept(result) }
-        do { result.config=try store.update(permit:permit) { _=$0.importNewMacMonitorFolders(roots) } }
+        guard !roots.isEmpty || bindings != (configured?.nativeJobReceipts ?? []) else { return try accept(result) }
+        do { result.config=try store.update(permit:permit) { _=$0.importNewMacMonitorFolders(roots);$0.nativeJobReceipts=bindings.isEmpty ? nil:bindings } }
         catch { result.health.partial=true;result.health.message += " · préférences indisponibles" }
         try permit.check()
         return try accept(result)
@@ -251,9 +332,9 @@ actor NativeRenderDiscovery {
     private let io:RenderBoundedIO
     private let engine:NativeRenderDiscoveryEngine
     init(reader:any NativeProcessReading = NativeProcessReader(),io:RenderBoundedIO=RenderBoundedIO(),scripts:any NativeScriptContractReading = NativeScriptContractReader()) { engine=NativeRenderDiscoveryEngine(reader:reader,scripts:scripts);self.io=io }
-    func collect(store:RenderConfigStore,links:[String:[String]],writable:Bool,at:Date=Date()) async -> NativeRenderDiscoveryResult {
+    func collect(store:RenderConfigStore,links:[String:[String]],writable:Bool,at:Date=Date(),historicalJobs:[RenderDashboardJob]=[]) async -> NativeRenderDiscoveryResult {
         let engine=self.engine
-        do { return try await io.run(lifetime:store.lifetime) { permit in try engine.collect(store:store,links:links,writable:writable,at:at,permit:permit) } }
+        do { return try await io.run(lifetime:store.lifetime) { permit in try engine.collect(store:store,links:links,writable:writable,at:at,permit:permit,historicalJobs:historicalJobs) } }
         catch {
             var health=SourceHealth();health.partial=true;health.isStale=true;health.checkedAt=at
             health.message="Découverte locale annulée, IO indisponible ou délai atteint · activité inconnue"

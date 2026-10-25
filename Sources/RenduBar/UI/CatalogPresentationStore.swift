@@ -4,6 +4,7 @@ import Combine
 @MainActor
 final class CatalogPresentationStore: ObservableObject {
     @Published private(set) var sections: [CatalogSection] = []
+    private(set) var targetsByProject: [String: [RenderFolderTarget]] = [:]
     private(set) var projects: [RenderDashboardProject] = []
     private(set) var projectByID: [String: RenderDashboardProject] = [:]
     private(set) var workByKey: [String: RenderCatalogWork] = [:]
@@ -11,6 +12,9 @@ final class CatalogPresentationStore: ObservableObject {
     private(set) var visibleProjects: [RenderDashboardProject] = []
     private(set) var visibleWorksByProject: [String: [RenderCatalogWork]] = [:]
     private(set) var visibleJobsByWork: [String: [RenderDashboardJob]] = [:]
+    private(set) var visibleJobByID: [String: RenderDashboardJob] = [:]
+    private(set) var visibleCountByProject: [String: Int] = [:]
+    private(set) var freshByProject: [String: Bool] = [:]
     private(set) var visibleJobIDs: Set<String> = []
     private var signature: Signature?
 
@@ -42,16 +46,22 @@ final class CatalogPresentationStore: ObservableObject {
         case .countsReached: return 3
         }
     }
-    private static func precedes(_ lhs: [RenderDashboardJob], title lhsTitle: String, id lhsID: String,
-                                 _ rhs: [RenderDashboardJob], title rhsTitle: String, id rhsID: String) -> Bool {
-        let left = lhs.map(priority).min() ?? 6, right = rhs.map(priority).min() ?? 6
-        if left != right { return left < right }
-        let leftDate = lhs.compactMap(\.observedAt).max() ?? .distantPast
-        let rightDate = rhs.compactMap(\.observedAt).max() ?? .distantPast
-        if leftDate != rightDate { return leftDate > rightDate }
-        let titleOrder = lhsTitle.compare(rhsTitle, options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "fr_FR"))
-        if titleOrder != .orderedSame { return titleOrder == .orderedAscending }
-        return lhsID < rhsID
+    private struct Rank {
+        let priority: Int
+        let newest: Date
+        let title: String
+        let id: String
+    }
+    private static func rank(_ jobs: [RenderDashboardJob], title: String, id: String) -> Rank {
+        var best = 6, newest = Date.distantPast
+        for job in jobs { best = min(best, priority(job)); newest = max(newest, job.observedAt ?? .distantPast) }
+        return Rank(priority: best, newest: newest, title: title, id: id)
+    }
+    private static func precedes(_ lhs: Rank, _ rhs: Rank) -> Bool {
+        if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
+        if lhs.newest != rhs.newest { return lhs.newest > rhs.newest }
+        let order = lhs.title.compare(rhs.title, options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "fr_FR"))
+        return order == .orderedSame ? lhs.id < rhs.id : order == .orderedAscending
     }
     func rebuild(_ snapshot: RenderCatalogSnapshot, query: String, scope: CatalogScope, source: Filter = .all, type: WorkFilter = .all) {
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -59,6 +69,7 @@ final class CatalogPresentationStore: ObservableObject {
         guard signature != next else { return }
         signature = next
         projects = snapshot.projects
+        targetsByProject = Dictionary(snapshot.projects.map { ($0.id, $0.openTargets) }, uniquingKeysWith: { first, _ in first })
         projectByID = Dictionary(snapshot.projects.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         workByKey = [:]; workByJob = [:]
         for work in snapshot.works {
@@ -70,6 +81,12 @@ final class CatalogPresentationStore: ObservableObject {
                 && (source == .all || (source == .shadow ? job.source.isShadow : !job.source.isShadow))
                 && (search.isEmpty || [job.title, job.projectTitle ?? "", job.workTitle ?? "", job.versionLabel ?? "", job.source.rawValue].contains { $0.localizedCaseInsensitiveContains(search) })
         }
+        visibleJobByID = Dictionary(filtered.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        visibleCountByProject = [:]; freshByProject = [:]
+        for job in filtered {
+            visibleCountByProject[job.projectID, default: 0] += 1
+            freshByProject[job.projectID] = (freshByProject[job.projectID] ?? true) && job.isFresh
+        }
         visibleJobIDs = Set(filtered.map(\.id))
         visibleProjects = snapshot.projects.filter { $0.jobs.contains { visibleJobIDs.contains($0.id) } }
         visibleWorksByProject = [:]; visibleJobsByWork = [:]
@@ -80,16 +97,25 @@ final class CatalogPresentationStore: ObservableObject {
                 visibleJobsByWork[Self.workKey(projectID: work.projectID, workID: work.id)] = jobs
             }
         }
+        let jobsByProject = Dictionary(grouping: filtered, by: \.projectID)
+        let projectRanks = Dictionary(visibleProjects.map { ($0.id, Self.rank(jobsByProject[$0.id] ?? [], title: $0.title, id: $0.id)) }, uniquingKeysWith: { first, _ in first })
         visibleProjects.sort { lhs, rhs in
-            Self.precedes(lhs.jobs.filter { visibleJobIDs.contains($0.id) }, title: lhs.title, id: lhs.id,
-                          rhs.jobs.filter { visibleJobIDs.contains($0.id) }, title: rhs.title, id: rhs.id)
+            guard let left = projectRanks[lhs.id], let right = projectRanks[rhs.id] else { return lhs.id < rhs.id }
+            return Self.precedes(left, right)
+        }
+        var workRanks: [String: Rank] = [:]
+        for works in visibleWorksByProject.values {
+            for work in works {
+                let key = Self.workKey(projectID: work.projectID, workID: work.id)
+                workRanks[key] = Self.rank(visibleJobsByWork[key] ?? [], title: work.title, id: work.id)
+            }
         }
         for projectID in Array(visibleWorksByProject.keys) {
-            let works = (visibleWorksByProject[projectID] ?? []).sorted { lhs, rhs in
-                Self.precedes(visibleJobsByWork[Self.workKey(projectID: lhs.projectID, workID: lhs.id)] ?? [], title: lhs.title, id: lhs.id,
-                              visibleJobsByWork[Self.workKey(projectID: rhs.projectID, workID: rhs.id)] ?? [], title: rhs.title, id: rhs.id)
+            visibleWorksByProject[projectID] = (visibleWorksByProject[projectID] ?? []).sorted { lhs, rhs in
+                guard let left = workRanks[Self.workKey(projectID: lhs.projectID, workID: lhs.id)],
+                      let right = workRanks[Self.workKey(projectID: rhs.projectID, workID: rhs.id)] else { return lhs.id < rhs.id }
+                return Self.precedes(left, right)
             }
-            visibleWorksByProject[projectID] = works
         }
         var order: [String] = [], grouped: [String: [RenderDashboardJob]] = [:], titles: [String: String] = [:]
         for job in filtered {

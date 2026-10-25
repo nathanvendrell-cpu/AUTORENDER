@@ -110,6 +110,72 @@ def validate_progress(descriptor,metadata):
   if not isinstance(row.get('seconds'),(int,float)) or not 0<row['seconds']<86400 or type(row.get('bytes')) is not int or row['bytes']<=0:raise Unsupported('completed metadata')
   seen.add(row['frame'])
  return {'total':len(descriptor['planned']),'records':len(rows),'counterFromRecordListOnly':False,'requiresStableFileValidation':True}
+def infer_direct_render(source,script_path,scene,argv):
+ """A direct top-level render invocation establishes task intent, never current GPU activity."""
+ tree=ast.parse(source)
+ if not any(isinstance(n,ast.Import) and any(x.name=='bpy' and x.asname is None for x in n.names) for n in tree.body):raise Unsupported('direct bpy import')
+ render_calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and ast.unparse(n.func)=='bpy.ops.render.render']
+ direct=[n.value for n in tree.body if isinstance(n,(ast.Expr,ast.Assign)) and isinstance(n.value,ast.Call) and ast.unparse(n.value.func)=='bpy.ops.render.render']
+ if len(direct)!=1 or len(render_calls)!=1:raise Unsupported('direct unconditional invocation')
+ call=direct[0]
+ if call.args or any(k.arg is None for k in call.keywords):raise Unsupported('direct operator arguments')
+ for n in ast.walk(tree):
+  if isinstance(n,(ast.Global,ast.Nonlocal)):raise Unsupported('dynamic binding')
+  if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id in ('exec','eval','compile','setattr','delattr','globals','locals'):raise Unsupported('dynamic execution')
+  if isinstance(n,ast.Name) and isinstance(n.ctx,(ast.Store,ast.Del)) and n.id=='bpy':raise Unsupported('bpy rebound')
+  if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and n.name=='bpy':raise Unsupported('bpy rebound')
+  if isinstance(n,ast.Import) and any((x.asname or x.name.split('.')[0])=='bpy' and (x.name!='bpy' or x.asname is not None) for x in n.names):raise Unsupported('bpy import rebound')
+  if isinstance(n,ast.ImportFrom) and any((x.asname or x.name)=='bpy' for x in n.names):raise Unsupported('bpy import rebound')
+  if isinstance(n,(ast.Assign,ast.AnnAssign,ast.AugAssign)):
+   targets=n.targets if isinstance(n,ast.Assign) else [n.target]
+   if any(ast.unparse(t)=='bpy' or ast.unparse(t).startswith('bpy.ops') for t in targets):raise Unsupported('operator rebound')
+ keywords={k.arg:k.value for k in call.keywords}
+ animation=keywords.get('animation',ast.Constant(False));still=keywords.get('write_still',ast.Constant(False))
+ if not isinstance(animation,ast.Constant) or type(animation.value) is not bool:raise Unsupported('unknown render mode')
+ if not isinstance(still,ast.Constant) or type(still.value) is not bool:raise Unsupported('unknown write mode')
+ # Resolve a narrow literal Path grammar; never eval/import the producer or run its expressions.
+ env={};aliases=set();output='';output_alias=None;path_trusted=False;str_trusted=True
+ def literal(n):
+  if isinstance(n,ast.Constant) and isinstance(n.value,str):return n.value
+  if isinstance(n,ast.Name) and n.id in env:return env[n.id]
+  if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and ((n.func.id=='Path' and path_trusted) or (n.func.id=='str' and str_trusted)) and len(n.args)==1 and not n.keywords:return literal(n.args[0])
+  if isinstance(n,ast.BinOp) and isinstance(n.op,ast.Div):return str(Path(literal(n.left))/literal(n.right))
+  raise Unsupported('nonliteral path')
+ for n in tree.body:
+  if getattr(n,'lineno',0)>=call.lineno:break
+  if isinstance(n,ast.ImportFrom) and n.module=='pathlib' and any(x.name=='Path' and x.asname is None for x in n.names):path_trusted=True
+  if isinstance(n,ast.Assign):
+   for target in n.targets:
+    if isinstance(target,ast.Name):
+     if target.id=='Path':path_trusted=False;output=''
+     if target.id=='str':str_trusted=False;output=''
+     aliases.discard(target.id)
+     if output_alias==target.id:output='';output_alias=None
+     if ast.unparse(n.value)=='bpy.context.scene':aliases.add(target.id)
+     try:env[target.id]=literal(n.value)
+     except Unsupported:env.pop(target.id,None)
+    elif ast.unparse(target) in {a+'.render.filepath' for a in aliases}:
+     try:output=literal(n.value);output_alias=ast.unparse(target).split('.')[0]
+     except Unsupported:output='';output_alias=None
+  else:
+   # Unhandled bindings (including conditional/loop/import/function bindings) only lose output inference.
+   if any(isinstance(x,ast.Attribute) and isinstance(x.ctx,(ast.Store,ast.Del)) and ast.unparse(x) in {a+'.render.filepath' for a in aliases} for x in ast.walk(n)):output='';output_alias=None
+   rebound={x.id for x in ast.walk(n) if isinstance(x,ast.Name) and isinstance(x.ctx,(ast.Store,ast.Del))}
+   if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):rebound.add(n.name)
+   if isinstance(n,(ast.Import,ast.ImportFrom)):
+    rebound.update(x.asname or x.name.split('.')[0] for x in n.names)
+    if isinstance(n,ast.ImportFrom) and n.module=='pathlib':rebound.discard('Path')
+   if 'Path' in rebound:path_trusted=False;output=''
+   if 'str' in rebound:str_trusted=False;output=''
+   for name in rebound:
+    aliases.discard(name);env.pop(name,None)
+    if output_alias==name:output='';output_alias=None
+ if output and (not Path(output).is_absolute() or len(output.encode())>4096 or any(ord(c)<32 for c in output)):output=''
+ if animation.value or not still.value:output=''
+ return {'scriptSHA256':hashlib.sha256(source.encode()).hexdigest(),'scene':scene,'metadataPath':'','outputRoot':str(Path(output).parent) if output else '',
+         'filenamePattern':str(Path(output)) if output else '', 'planned':[1] if not animation.value else [],'plannedKey':'planned','completedKey':'completed','frameKey':'frame','secondsKey':'seconds',
+         'variant':'direct_render','mode':'animation' if animation.value else 'still','grammar':'direct_top_level_render_v1','executionRunAttested':False}
+
 def infer_snapshot(snapshot,static_only=False):
  """Automatic in-memory binding from a canonical same-user process snapshot.
  Caller must recheck the process identity after IO, exactly as NativeRenderDiscovery.
@@ -127,10 +193,11 @@ def infer_snapshot(snapshot,static_only=False):
  if before.st_mtime>birth:raise Unsupported('script modified after process birth')
  raw_source=path.read_bytes();source=raw_source.decode("utf-8");after=path.stat()
  if (before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_ino,after.st_size,after.st_mtime_ns):raise Unsupported('source changed')
- descriptor=infer(source,script,scene,argv)
+ try:descriptor=infer(source,script,scene,argv)
+ except Unsupported:descriptor=infer_direct_render(source,script,scene,argv)
  descriptor["scriptSHA256"]=hashlib.sha256(raw_source).hexdigest()
  descriptor['metadataFingerprint']=None
- if not static_only:
+ if not static_only and descriptor["grammar"]!="direct_top_level_render_v1":
   try:
    metadata_path=Path(descriptor['metadataPath']);output=Path(descriptor['outputRoot'])
    if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.stat().st_size>32768 or output.is_symlink() or not output.is_dir():raise Unsupported('scope files')

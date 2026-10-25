@@ -4,14 +4,24 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: MonitorModel
     let openCompact: () -> Void
+    let quit: () -> Void
     @StateObject private var selection: CatalogSelectionController
     private var projectID: String { selection.projectID }
     private var selectedWorkID: String { selection.workID }
     private var jobID: String { selection.jobID }
-    init(model: MonitorModel, openCompact: @escaping () -> Void, selectionDefaults: UserDefaults = .standard) {
-        self.model = model; self.openCompact = openCompact
+    init(model: MonitorModel, openCompact: @escaping () -> Void, quit: @escaping () -> Void = { NSApp.terminate(nil) }, initialScope: CatalogScope = .direct, initialLibrary: Bool = false, selectionDefaults: UserDefaults = .standard) {
+        self.model = model; self.openCompact = openCompact; self.quit = quit
+        _catalogScope = State(initialValue: initialScope)
+        _showLibrary = State(initialValue: initialLibrary)
         _selection = StateObject(wrappedValue: CatalogSelectionController(defaults: selectionDefaults))
     }
+    @StateObject private var activeHierarchy = CatalogHierarchyStore()
+    @StateObject private var historyHierarchy = CatalogHierarchyStore()
+    private var hierarchy: CatalogHierarchyStore { catalogScope == .direct ? activeHierarchy : historyHierarchy }
+    @State private var projectPage = 0
+    @State private var activeProjectionRevision: UInt64 = 0
+    @State private var emptyActiveTitle = "Observation en attente"
+    @State private var showLibrary = false
     @StateObject private var presentation = CatalogPresentationStore()
     private let ink = RenderStyle.ink
     private let muted = RenderStyle.secondary
@@ -34,20 +44,42 @@ struct ContentView: View {
     }
     private var selectedWork: RenderCatalogWork? {
         guard let project = selectedProject else { return nil }
-        let works = presentation.visibleWorksByProject[project.id] ?? []
-        return works.first { $0.id == selectedWorkID } ?? (selection.explicitDashboardTarget == nil ? works.first : nil)
+        if let work = presentation.work(projectID: project.id, workID: selectedWorkID),
+           presentation.visibleJobsByWork[CatalogPresentationStore.workKey(projectID: project.id, workID: work.id)] != nil { return work }
+        return selection.explicitDashboardTarget == nil ? presentation.visibleWorksByProject[project.id]?.first : nil
     }
     private var selectedJob: RenderDashboardJob? {
         guard let work = selectedWork else { return nil }
-        let jobs = presentation.visibleJobsByWork[CatalogPresentationStore.workKey(projectID: work.projectID, workID: work.id)] ?? []
-        return jobs.first { $0.id == jobID } ?? (selection.explicitDashboardTarget == nil ? jobs.first : nil)
+        if let job = presentation.visibleJobByID[jobID], job.projectID == work.projectID,
+           presentation.workByJob[job.id]?.id == work.id { return job }
+        return selection.explicitDashboardTarget == nil ? presentation.visibleJobsByWork[CatalogPresentationStore.workKey(projectID: work.projectID, workID: work.id)]?.first : nil
     }
     private func matches(_ job: RenderDashboardJob) -> Bool { presentation.visibleJobIDs.contains(job.id) }
     private var visibleProjects: [RenderDashboardProject] { presentation.visibleProjects }
     private func rebuildPresentation() {
-        presentation.rebuild(model.catalogSnapshot, query: query, scope: catalogScope, source: filter, type: workFilter)
+        if catalogScope == .direct {
+            activeProjectionRevision &+= 1
+            switch model.menuBarObservation(at: Date()) {
+            case .confirmed: emptyActiveTitle = "Aucun rendu actif détecté"
+            case .refreshing: emptyActiveTitle = "Actualisation en cours"
+            case .uncertain: emptyActiveTitle = "Activité à confirmer"
+            }
+        }
+        let snapshot = catalogScope == .direct
+            ? CatalogProjectionSnapshot.active(model.activeRenderJobs, revision: activeProjectionRevision)
+            : CatalogProjectionSnapshot.history(model.catalogSnapshot, revision: model.historyRevision)
+        presentation.rebuild(snapshot, query: query, scope: catalogScope, source: filter, type: workFilter)
+        if let job = presentation.visibleJobByID[jobID], job.projectID != selection.projectID,
+           let work = presentation.workByJob[job.id] { selection.choose(job, workID: work.id) }
         if catalogScope == .direct { selection.reconcileActive(presentation) }
         else { selection.reconcile(presentation) }
+        let jobs = snapshot.jobs.filter { presentation.visibleJobIDs.contains($0.id) }
+        let contexts = Dictionary(jobs.map { ($0.id, CatalogHierarchyContext(job: $0)) }, uniquingKeysWith: { first, _ in first })
+        let revision = catalogScope == .direct ? snapshot.revision : model.historyRevision
+        let key = "\(revision)|\(catalogScope.rawValue)|\(query)|\(filter.rawValue)|\(workFilter.rawValue)"
+        hierarchy.rebuild(records: jobs.map { CatalogHierarchyRecord(job: $0) }, contexts: contexts, key: key, revealJobID: selectedJob?.id)
+        if let position = visibleProjects.firstIndex(where: { $0.id == selectedProject?.id }) { projectPage = position / 50 }
+        else { projectPage = 0 }
     }
 
     private func applyDashboardNavigation() {
@@ -56,7 +88,7 @@ struct ContentView: View {
         if let job = model.catalogSnapshot.jobs.first(where: { $0.id == request.jobID }),
            let targetScope = CatalogScope.dashboardScope(for: job) {
             selection.apply(request)
-            catalogScope = targetScope
+            catalogScope = request.scope == .finished && model.config.jobArchives[job.id] == nil && job.isTerminalRender ? .finished : targetScope
         } else if request.scope == .archived || request.scope == .finished {
             selection.apply(request)
             catalogScope = request.scope
@@ -69,7 +101,9 @@ struct ContentView: View {
         rebuildPresentation()
         selection.consumeDashboardNavigation(request.id)
     }
-    var body: some View {
+    var body: some View { presentedLayout }
+
+    private var baseLayout: some View {
         VStack(alignment: .leading, spacing: 16) {
             header
             if let error = model.configurationError { Text("Préférences indisponibles").font(.system(size: 12)).foregroundStyle(.orange).help(error) }
@@ -91,23 +125,58 @@ struct ContentView: View {
                 Text("Progression par version")
                 Spacer()
                 Button("Moniteur complet") { NSWorkspace.shared.open(URL(string: "http://127.0.0.1:4420/")!) }.buttonStyle(.link)
-                Button("Quitter") { NSApp.terminate(nil) }.buttonStyle(.link)
+                Button("Quitter", action: quit).buttonStyle(.link)
             }.font(.system(size: 11)).foregroundStyle(muted)
         }.padding(22).foregroundStyle(ink).renderWindowSurface()
             .frame(minWidth: 920, minHeight: 650)
-            .onAppear { applyDashboardNavigation(); rebuildPresentation() }
+    }
+
+    private var observedLayout: some View {
+        baseLayout
+            .onAppear(perform: appear)
             .onChange(of: selection.dashboardNavigation?.id) { applyDashboardNavigation() }
-            .onChange(of: model.catalogSnapshot.revision) { rebuildPresentation() }
+            .onChange(of: model.catalogSnapshot.revision) { if catalogScope == .direct { rebuildPresentation() } }
+            .onChange(of: model.historyRevision) { rebuildPresentation() }
+            .onChange(of: model.observationRevision) { if catalogScope == .direct { rebuildPresentation() } }
+            .onReceive(NotificationCenter.default.publisher(for: CatalogProjectionSnapshot.request, object: model), perform: receiveOverviewRequest)
+    }
+
+    private var filteredLayout: some View {
+        observedLayout
             .onChange(of: query) { rebuildPresentation() }
             .onChange(of: catalogScope) { rebuildPresentation() }
             .onChange(of: filter) { rebuildPresentation() }
             .onChange(of: workFilter) { rebuildPresentation() }
             .onChange(of: jobID) { selection.remember(presentation); showHistory = false }
             .onChange(of: selectedWorkID) { selection.remember(presentation) }
-            .onDisappear { model.setVisiblePreviewEntries([]) }
+    }
+
+    private var presentedLayout: some View {
+        filteredLayout
+            .onDisappear(perform: stopProjection)
+            .sheet(isPresented: $showLibrary) { LibrarySettingsView(model: model) }
             .sheet(isPresented: $showSources) { SourcesView(model: model) }
             .sheet(isPresented: $showHistory) { if let job = selectedJob { HistoryPanel(model: model, job: job) } }
             .sheet(item: $organizingJob) { OrganisationView(model: model, job: $0) }
+    }
+
+    private func appear() { applyDashboardNavigation(); rebuildPresentation() }
+    private func stopProjection() {
+        activeHierarchy.cancel(); historyHierarchy.cancel(); model.setVisiblePreviewEntries([])
+    }
+    private func receiveOverviewRequest(_ notification: Notification) {
+        if let id = notification.userInfo?["restoredJobID"] as? String,
+           var job = model.catalogSnapshot.jobs.first(where: { $0.id == id }), job.isTerminalRender {
+            job.archivedAt = nil
+            let workID = presentation.workByJob[id]?.id ?? job.workID ?? "job:" + job.id
+            selection.openInDashboard(job, workID: workID)
+            applyDashboardNavigation()
+            return
+        }
+        if let raw = notification.userInfo?["scope"] as? String, let scope = CatalogScope(rawValue: raw) {
+            selection.clearDashboardTarget(); catalogScope = scope; resetSecondaryFilters()
+        }
+        if notification.userInfo?["library"] as? Bool == true { showLibrary = true }
     }
 
     private var header: some View {
@@ -117,10 +186,11 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("AUTORENDER").font(.system(size: 14, weight: .bold, design: .rounded)).tracking(2.8).foregroundStyle(accent)
                     Text("Rendus").font(.system(size: 28, weight: .semibold))
-                    Text("Projets · versions").font(.system(size: 12)).foregroundStyle(muted)
+                    Text("Projets · sous-projets · scènes · versions").font(.system(size: 12)).foregroundStyle(muted)
                 }
             }.renderWindowDragRegion(enabled: true)
             Spacer()
+            Button("Bibliothèque") { showLibrary = true }.buttonStyle(.bordered)
             Button("Suivi compact", action: openCompact).buttonStyle(.bordered)
             Button("Sources suivies") { showSources = true }.buttonStyle(.bordered)
             Button { model.refreshNow() } label: { Label("Actualiser", systemImage: "arrow.clockwise") }.buttonStyle(.bordered)
@@ -142,17 +212,17 @@ struct ContentView: View {
             }.pickerStyle(.menu)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(visibleProjects) { project in
+                    ForEach(Array(visibleProjects.dropFirst(projectPage * 50).prefix(50))) { project in
                         VStack(alignment: .leading, spacing: 7) {
                             HStack(alignment: .top, spacing: 5) {
-                                CatalogFolderName(name: project.title, targets: project.openTargets)
+                                CatalogFolderName(name: project.title, targets: presentation.targetsByProject[project.id] ?? [])
                                     .font(.system(size: 14, weight: .semibold)).multilineTextAlignment(.leading)
                                 Spacer(minLength: 2)
                                 Button { choose(project) } label: { Image(systemName: "arrow.right.circle") }
                                     .buttonStyle(.plain).help("Afficher les travaux du projet").accessibilityLabel("Sélectionner le projet " + project.title)
                             }
-                            Text(catalogScope == .direct ? "\(project.jobs.filter(matches).count) versions en cours" : "\(project.jobs.filter(matches).count) versions affichées").font(.system(size: 11)).foregroundStyle(muted)
-                            Text(project.jobs.allSatisfy(\.isFresh) ? "Sources récentes" : "Dernier relevé / source indisponible")
+                            Text(catalogScope == .direct ? "\(presentation.visibleCountByProject[project.id] ?? 0) versions en cours" : "\(presentation.visibleCountByProject[project.id] ?? 0) versions affichées").font(.system(size: 11)).foregroundStyle(muted)
+                            Text(presentation.freshByProject[project.id] == true ? "Sources récentes" : "Dernier relevé / source indisponible")
                                 .font(.system(size: 10)).foregroundStyle(muted)
                         }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
                             .background(project.id == selectedProject?.id ? accent.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 12)).renderGlass(radius: 12, shadow: 2)
@@ -161,6 +231,13 @@ struct ContentView: View {
                     }
                     if visibleProjects.isEmpty { Text("Aucun projet pour ces filtres.").font(.system(size: 12)).foregroundStyle(muted) }
                 }
+            }
+            if visibleProjects.count > 50 {
+                HStack {
+                    Button("Précédent") { projectPage -= 1 }.disabled(projectPage == 0)
+                    Text("\(projectPage * 50 + 1)–\(min((projectPage + 1) * 50, visibleProjects.count)) / \(visibleProjects.count)").font(.system(size: 10))
+                    Button("Suivant") { projectPage += 1 }.disabled((projectPage + 1) * 50 >= visibleProjects.count)
+                }.font(.system(size: 11))
             }
             Divider()
             Text("\(presentation.visibleJobIDs.count) versions · \(catalogScope.rawValue)").font(.system(size: 11)).foregroundStyle(muted)
@@ -174,14 +251,23 @@ struct ContentView: View {
         query = ""; filter = .all; workFilter = .all
         rebuildPresentation()
     }
+    private var emptyScopeTitle: String {
+        switch catalogScope {
+        case .direct: return emptyActiveTitle
+        case .finished: return "Aucun rendu fait pour ces filtres"
+        case .archived: return "Aucune archive pour ces filtres"
+        case .unclassified: return "Aucun rendu à classer pour ces filtres"
+        case .all, .follow: return "Aucun rendu pour ces filtres"
+        }
+    }
     private var emptyFilters: some View {
         VStack(alignment: .leading, spacing: 14) {
             Image(systemName: "line.3.horizontal.decrease.circle").font(.system(size: 30)).foregroundStyle(accent)
-            Text(catalogScope == .direct ? "Aucun rendu actif détecté" : catalogScope == .finished ? "Aucun rendu terminé pour ces filtres" : "Aucune archive pour ces filtres")
+            Text(emptyScopeTitle)
                 .font(.system(size: 23, weight: .semibold))
-            Text(catalogScope == .direct ? "Les rendus qui cessent d’être actifs quittent cette vue automatiquement. Les candidats restent dans Sources." : model.catalogSnapshot.jobs.isEmpty ? "Aucun rendu connu. Vérifiez les sources connectées et les dossiers suivis." : "Cette combinaison de source, de type et de recherche ne correspond à aucun rendu.")
+            Text(catalogScope == .direct ? "Les rendus qui cessent d’être actifs quittent cette vue automatiquement. Les candidats restent dans Sources." : model.catalogSnapshot.knownJobCount == 0 ? "Aucun rendu connu. Vérifiez les sources connectées et les dossiers suivis." : "Cette combinaison de source, de type et de recherche ne correspond à aucun rendu.")
                 .font(.system(size: 13)).foregroundStyle(muted)
-            Text("Dernier relevé : " + (model.catalogSnapshot.jobs.compactMap(\.observedAt).max()?.formatted(date: .abbreviated, time: .shortened) ?? "indisponible"))
+            Text("Dernier cycle d’observation : " + model.lastScan.formatted(date: .abbreviated, time: .shortened))
                 .font(.system(size: 11)).foregroundStyle(muted)
             HStack(spacing: 12) {
                 Button(catalogScope == .archived ? "Voir toutes les archives" : "Réinitialiser les filtres", action: resetSecondaryFilters)
@@ -221,52 +307,25 @@ struct ContentView: View {
     }
 
     private func projectDashboard(_ project: RenderDashboardProject) -> some View {
-        let works = presentation.visibleWorksByProject[project.id] ?? []
-        return VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                CatalogFolderName(name: project.title, targets: project.openTargets)
+                CatalogFolderName(name: project.title, targets: presentation.targetsByProject[project.id] ?? [])
                     .font(.system(size: 23, weight: .semibold, design: .rounded))
-                CatalogFolderMenu(targets: project.openTargets, label: "Dossiers des versions", iconOnly: true)
+                CatalogFolderMenu(targets: presentation.targetsByProject[project.id] ?? [], label: "Dossiers des versions", iconOnly: true)
                 Spacer()
-                Text("\(works.count) \(works.count == 1 ? "travail" : "travaux") · versions séparées").font(.system(size: 11)).foregroundStyle(muted)
+                Text("\(presentation.visibleCountByProject[project.id] ?? 0) versions").font(.system(size: 11)).foregroundStyle(muted)
             }
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(works) { work in
-                        Button { choose(work) } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: work.id == selectedWork?.id ? "square.stack.fill" : "square.stack").foregroundStyle(accent)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(work.title).font(.system(size: 12, weight: .semibold)).lineLimit(2)
-                                    Text("\(presentation.visibleJobsByWork[CatalogPresentationStore.workKey(projectID: work.projectID, workID: work.id)]?.count ?? 0) versions · " + (work.workType?.label ?? "Type non déclaré"))
-                                        .font(.system(size: 10)).foregroundStyle(muted)
-                                }
-                                Spacer()
-                                let active = presentation.visibleActiveCount(projectID: work.projectID, workID: work.id)
-                                Text(catalogScope == .direct ? "\(active) en cours" : catalogScope.rawValue).font(.system(size: 10)).monospacedDigit().foregroundStyle(muted)
-                            }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
-                                .background(work.id == selectedWork?.id ? accent.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 10)).renderGlass(radius: 12, shadow: 2)
-                        }.buttonStyle(.plain).help(work.title)
-                    }
+                CatalogHierarchyBrowser(store: hierarchy, projectID: project.id, selectedJobID: selectedJob?.id) { id in
+                    guard let job = presentation.visibleJobByID[id], let work = presentation.workByJob[id] else { return }
+                    selection.choose(job, workID: work.id); showHistory = false
                 }
-            }.frame(maxHeight: 190)
-            if let work = selectedWork {
-                if work.jobs.count > 1 || !work.id.hasPrefix("job:") {
-                HStack {
-                    Text(work.title).font(.system(size: 15, weight: .semibold)).lineLimit(2)
-                    Spacer()
-                    Picker("Version", selection: Binding(get: { selectedJob?.id ?? jobID }, set: { id in
-                        if let job = work.jobs.first(where: { $0.id == id }) { selection.choose(job, workID: work.id) }
-                    })) {
-                        ForEach(presentation.visibleJobsByWork[CatalogPresentationStore.workKey(projectID: work.projectID, workID: work.id)] ?? []) { Text($0.versionLabel ?? $0.title).tag($0.id) }
-                    }.pickerStyle(.menu).frame(maxWidth: 360)
-                }
-                }
-                if let job = selectedJob, matches(job) {
-                    JobDetailView(model: model, job: job, onOrganize: { organizingJob = $0 }, onHistory: { showHistory = true })
-                } else { Text("Choisissez une version correspondant à ces filtres.").font(.system(size: 12)).foregroundStyle(muted) }
-            } else { Text("Choisissez un travail. Les versions ne sont pas regroupées sans identité explicite.").font(.system(size: 12)).foregroundStyle(muted) }
-        }.frame(maxWidth: 1100, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
+            }.frame(height: 260)
+            if let job = selectedJob, matches(job) {
+                JobDetailView(model: model, job: job, onOrganize: { organizingJob = $0 }, onHistory: { showHistory = true })
+            } else {
+                Text("Choisissez une version dans son sous-projet et sa scène.").font(.system(size: 12)).foregroundStyle(muted)
+            }
+        }.frame(maxWidth: 1100, alignment: .leading).frame(maxWidth: .infinity, alignment: .topLeading)
     }
 }

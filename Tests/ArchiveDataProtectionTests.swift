@@ -5,9 +5,7 @@ import CryptoKit
  static func check(_ value:Bool,_ message:String){checks+=1;precondition(value,message)}
  static func job(_ id:String,active:Bool)->RenderDashboardJob {
   var h=SourceHealth();h.online=true;h.observedAt=Date()
-  var job=RenderDashboard.mac(MacJob(id:id,titre:"SIMULATED",sous:nil,total:10,faites:active ? 3 : 10,en_cours:[],latest:[],times:[],proc:active ? MacProcess(cpu:"1",ram_mo:1,duree:"00:01") : nil),health:h,projectID:"fixture",workType:nil)
-  job.taskQualification=active ? .nativeRenderCommand:nil // Explicit simulated task qualification.
-  return job
+  return RenderDashboard.mac(MacJob(id:id,titre:"SIMULATED",sous:nil,total:10,faites:active ? 3 : 10,en_cours:[],latest:[],times:[],proc:active ? MacProcess(cpu:"1",ram_mo:1,duree:"00:01") : nil),health:h,projectID:"fixture",workType:nil)
  }
  @MainActor static func main() async throws {
   let root=FileManager.default.temporaryDirectory.appendingPathComponent("autoren-archive-protection-"+UUID().uuidString)

@@ -11,7 +11,17 @@ struct NativeScriptDescriptor:Codable {
     }
     let mapping:NativeMetadataSourceConfig
     let descriptor:Plan
+    var isDirectRender:Bool {descriptor.grammar=="direct_top_level_render_v1"}
     func validated(snapshot:NativeProcessSnapshot,observation:NativeRenderObservation)->Bool {
+        if isDirectRender {
+            return mapping.processIdentity==snapshot.identity && mapping.scene==observation.scene && descriptor.scene==observation.scene
+                && descriptor.scriptSHA256.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil
+                && ((descriptor.mode=="still" && descriptor.planned==[1]) || (descriptor.mode=="animation" && descriptor.planned.isEmpty))
+                && descriptor.metadataPath.isEmpty && mapping.metadataPath.isEmpty
+                && mapping.outputRoot==descriptor.outputRoot && mapping.filenamePattern==descriptor.filenamePattern
+                && (descriptor.filenamePattern.isEmpty || (NativeRenderPaths.absolute(descriptor.filenamePattern)==descriptor.filenamePattern && URL(fileURLWithPath:descriptor.filenamePattern).deletingLastPathComponent().path==descriptor.outputRoot))
+        }
+
         guard mapping.processIdentity==snapshot.identity,mapping.scene==observation.scene,descriptor.scene==observation.scene,
               descriptor.grammar=="static_per_frame_python_v1",descriptor.scriptSHA256.range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil,
               mapping.metadataPath==descriptor.metadataPath,mapping.outputRoot==descriptor.outputRoot,mapping.filenamePattern==descriptor.filenamePattern,

@@ -69,7 +69,7 @@ class Tests(unittest.TestCase):
  def test_actual_local_fake_ssh_stdin_pipe_and_reaping(self):
   with tempfile.TemporaryDirectory(prefix='autoren-local-fake-ssh-') as td:
    root=Path(td);fake=root/'ssh';received=root/'received.json'
-   fake.write_text("#!"+sys.executable+" -B\nimport sys,base64,gzip,json,os\nfrom pathlib import Path\npayload=sys.stdin.buffer.read();script=gzip.decompress(base64.b64decode(payload));Path("+repr(str(received))+").write_text(json.dumps({'pid':os.getpid(),'bytes':len(script),'sha256':__import__('hashlib').sha256(script).hexdigest(),'argvLength':len(sys.argv[-1])}));print(json.dumps({'ok':True}))\n")
+   fake.write_text("#!/opt/homebrew/bin/python3 -B\nimport sys,base64,gzip,json,os\nfrom pathlib import Path\npayload=sys.stdin.buffer.read();script=gzip.decompress(base64.b64decode(payload));Path("+repr(str(received))+").write_text(json.dumps({'pid':os.getpid(),'bytes':len(script),'sha256':__import__('hashlib').sha256(script).hexdigest(),'argvLength':len(sys.argv[-1])}));print(json.dumps({'ok':True}))\n")
    fake.chmod(0o700);command,payload=observer.stdin_transport([])
    result=collector.run([str(fake),command],2,input_bytes=payload);record=json.loads(received.read_text())
    self.assertEqual(json.loads(result),{'ok':True});self.assertEqual(record['sha256'],hashlib.sha256(observer.ps_script([]).encode()).hexdigest());self.assertLess(record['argvLength'],8191)
@@ -78,7 +78,7 @@ class Tests(unittest.TestCase):
  def test_actual_local_timeout_reaps_stubborn_child(self):
   with tempfile.TemporaryDirectory(prefix='autoren-local-timeout-') as td:
    root=Path(td);fake=root/'ssh';pidfile=root/'pid'
-   fake.write_text("#!"+sys.executable+" -B\nimport signal,time,os\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM,signal.SIG_IGN);Path("+repr(str(pidfile))+").write_text(str(os.getpid()));time.sleep(10)\n");fake.chmod(0o700)
+   fake.write_text("#!/opt/homebrew/bin/python3 -B\nimport signal,time,os\nfrom pathlib import Path\nsignal.signal(signal.SIGTERM,signal.SIG_IGN);Path("+repr(str(pidfile))+").write_text(str(os.getpid()));time.sleep(10)\n");fake.chmod(0o700)
    real_spawn=collector.subprocess.Popen
    def ready_spawn(*args,**kwargs):
     process=real_spawn(*args,**kwargs);deadline=time.monotonic()+5

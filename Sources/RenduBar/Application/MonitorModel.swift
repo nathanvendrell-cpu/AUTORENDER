@@ -29,12 +29,97 @@ final class MonitorModel: ObservableObject {
     @Published private(set) var lastScan = Date()
     @Published private(set) var configurationError: String?
     private var configurationWritable = true
+    @Published private(set) var compactPreviewVisible=false
     private let previews: RenderPreviewStore
     private var previewUpdates:AnyCancellable?
     @Published private(set) var archiveError: String?
     @Published private(set) var organizationError: String?
     @Published private(set) var catalogSnapshot = RenderCatalogSnapshot.empty
+    private var lastCatalogHistoryRevision:UInt64=0
+    @Published private(set) var historyRevision:UInt64=0
+    @Published private(set) var activeRenderJobs:[RenderDashboardJob]=[]
     @Published private(set) var dashboardProjects: [RenderDashboardProject] = []
+    @Published private(set) var libraryRecords:[RenderLibraryRecord]=[]
+    @Published private(set) var libraryError:String?
+    private let managedLibrary:ManagedRenderLibrary
+    private let libraryCoordinator:RenderLibraryCoordinator
+    private var libraryTask:Task<Void,Never>?
+    @Published private(set) var libraryBusy=false
+    @Published private(set) var libraryActivities:[RenderLibraryActivity]=[]
+    var librarySettings:RenderLibrarySettings {config.librarySettings ?? .observation}
+    @discardableResult
+    func setLibraryMode(_ mode:RenderLibraryMode,rootPath:String?=nil,manageFutureJobs:Bool=false)->Bool {
+        guard !stopping,!libraryBusy else{return false}
+        let selected=rootPath ?? librarySettings.rootPath
+        let root=URL(fileURLWithPath:RenderContextPath.absolute(selected) ?? selected)
+        guard (rootPath ?? librarySettings.rootPath).hasPrefix("/"),!root.pathComponents.contains(where:{$0.caseInsensitiveCompare("BRAIN") == .orderedSame}),
+              mode == .catalogueOnly || manageFutureJobs else{libraryError="Activation explicite des nouveaux jobs et bibliothèque hors BRAIN requises";return false}
+        let settings=RenderLibrarySettings(mode:mode,rootPath:root.path,activatedAt:mode == .managedLibrary ? Date():nil,exportInMemory:librarySettings.exportInMemory)
+        let saved=mutatePreferences{$0.librarySettings=settings}
+        if saved {libraryError=nil;scheduleLibraryPolicy(settings)}
+        return saved
+    }
+    @discardableResult
+    func setInMemoryExportEnabled(_ enabled:Bool)->Bool {
+        guard !stopping,!libraryBusy else{return false}
+        var settings=librarySettings;settings.exportInMemory=enabled
+        let saved=mutatePreferences{$0.librarySettings=settings}
+        if saved {libraryError=nil;scheduleLibraryPolicy(settings)}
+        return saved
+    }
+    @discardableResult
+    func setProjectBindings(_ bindings:[RenderProjectBinding])->Bool {
+        guard bindings.count<=128,Set(bindings.map(\.id)).count==bindings.count,bindings.allSatisfy(\.isValid) else{organizationError="Liaisons de projet invalides";return false}
+        guard mutatePreferences({$0.projectBindings=bindings}) else{return false};combine();return true
+    }
+    @discardableResult
+    func setContextRules(_ rules:[RenderContextRule])->Bool {
+        guard rules.count<=128,Set(rules.map(\.id)).count==rules.count,rules.allSatisfy(\.isValid) else{organizationError="Règles explicites invalides ou ambiguës";return false}
+        guard mutatePreferences({$0.contextRules=rules}) else{return false};combine();return true
+    }
+    func previewLibraryBatch(_ candidates:[RenderLibraryCandidate]) async->[RenderLibraryPlan] {
+        guard !stopping,candidates.count<=200 else{return []}
+        let jobs=Dictionary(catalogSnapshot.jobs.map{($0.id,$0)},uniquingKeysWith:{$1});var plans:[RenderLibraryPlan]=[]
+        for candidate in candidates {
+            guard let job=jobs[candidate.jobID] else{continue}
+            plans.append(await managedLibrary.preview(job:job,candidate:candidate,settings:librarySettings))
+        }
+        return plans
+    }
+    func applyLibraryBatch(_ plans:[RenderLibraryPlan],approval:RenderLibraryApproval) async->[RenderLibraryRecord] {
+        guard !stopping,!libraryBusy,!plans.isEmpty,plans.count<=200,approval.planIDs==Set(plans.map(\.id)) else{libraryError="Validation du lot exact requise";return []}
+        libraryBusy=true;defer{libraryBusy=false}
+        var result:[RenderLibraryRecord]=[]
+        for plan in plans {
+            do {let record=try await managedLibrary.execute(plan,approval:approval,settings:librarySettings);result.append(record)}
+            catch {libraryError=String(describing:error);break}
+        }
+        libraryRecords=await managedLibrary.recentRecords();if !result.isEmpty {historyRevision &+= 1};return result
+    }
+    func reloadLibraryRecords() async {
+        do {libraryRecords=try await managedLibrary.loadRecent(settings:librarySettings)}
+        catch {libraryError=String(describing:error)}
+    }
+    func undoLibraryRecord(_ id:String,approvedRecordID:String) async->Bool {
+        guard !stopping,!libraryBusy else{return false}
+        libraryBusy=true;defer{libraryBusy=false}
+        do {_ = try await libraryCoordinator.undo(id,approvedRecordID:approvedRecordID,settings:librarySettings,remoteMonitoringEnabled:config.shadowMonitoringEnabled);libraryRecords=await managedLibrary.recentRecords();historyRevision &+= 1;return true}
+        catch {libraryError=String(describing:error);return false}
+    }
+    func libraryRecords(forJobID id:String,cursor:String?=nil,limit:Int=50) async->RenderLibraryJobPage {
+        guard !stopping else{return .init(records:[],nextCursor:nil)}
+        do{return try await managedLibrary.recordsForJob(id,cursor:cursor,limit:limit,settings:librarySettings)}
+        catch{libraryError=String(describing:error);return .init(records:[],nextCursor:nil)}
+    }
+    func libraryLocation(forRecordID id:String) async->RenderLibraryLocation? {
+        guard !stopping else{return nil}
+        do{return try await managedLibrary.verifiedLocation(id,settings:librarySettings)}
+        catch{libraryError="Sortie classée modifiée ou indisponible";return nil}
+    }
+    func revealLibraryRecord(_ id:String) async->Bool {
+        guard let location=await libraryLocation(forRecordID:id),!stopping,let file=location.fileURL else{return false}
+        NSWorkspace.shared.activateFileViewerSelecting([file]);return true
+    }
     private let catalogue: RenderCatalogService
     private let storageRoot: URL
     private let collectionLifetime=RenderTaskLifetime()
@@ -45,7 +130,126 @@ final class MonitorModel: ObservableObject {
     private let registryWorker = MacMonitorRegistryWorker()
     private let shadowRuns:ShadowRunDiscovery
     private var shadowRunUpdates:AnyCancellable?
+    private var softwareUpdateShadowRequests=0
+    private var softwareUpdateScopeGeneration:UInt64=0
+    private var softwareUpdateShadowScope:SoftwareUpdatePolicy.ShadowScope = .uncertain
+    private var softwareUpdateShadowWasConfigured=false
+    private var softwareUpdateSnapshotGeneration:UInt64=0
     var shadowRunHealth:SourceHealth {shadowRuns.health}
+    var shadowActivityHealth:SourceHealth {shadowRuns.activityHealth}
+    @Published private(set) var observationRevision:UInt64=0
+
+    // Pure coverage assessment: existing cycles publish freshness even with an unchanged catalogue.
+    func menuBarObservation(at now:Date) -> MenuBarObservation {
+        guard collectionEnabled,!stopping else{return .uncertain("Observation arrêtée ou simulée")}
+        guard configurationWritable,configurationError==nil,config.archivePayloadError==nil,
+              activityRegistryIsTrusted(at:now) else{return .uncertain("Configuration ou registre non confirmé")}
+        let refreshing=libraryBusy || nativeTask != nil || registryTask != nil || registryPending || folderBusy || folderPending
+            || macBusy || shadowBusy || shadowRemoteBusy || softwareUpdateShadowRequests>0 || shadowRuns.isRefreshing || declarationTask != nil
+        func waiting(_ reason:String)->MenuBarObservation {refreshing ? .refreshing:.uncertain(reason)}
+        // During an in-flight cycle, retain the last adopted proof while it is still fresh.
+        let adopted=nativeCompletedGeneration>0 && nativeCatalogueGeneration>0
+        let converged=nativeCompletedGeneration==nativeRequestedGeneration && softwareUpdateSnapshotGeneration==snapshotGeneration
+        let nativeIDs=Set(nativeObservations.map{$0.dashboard(entries:[],now:now)}.filter(\.isDetectedActiveRender).map(\.id))
+        let pcIDs=Set(shadowRuns.jobs.filter(\.isDetectedActiveRender).map(\.id))
+        let shownNative=Set(catalogSnapshot.jobs.filter{$0.id.hasPrefix("mac:native:") && $0.isDetectedActiveRender}.map(\.id))
+        let shownPC=Set(catalogSnapshot.jobs.filter{($0.id.hasPrefix("shadow:process:") || $0.id.hasPrefix("shadow:run:")) && $0.isDetectedActiveRender}.map(\.id))
+        let unchangedActivity=nativeIDs==shownNative && pcIDs==shownPC
+        guard adopted,(converged || unchangedActivity) else{return waiting("Catalogue en attente de la dernière observation")}
+        func current(_ health:SourceHealth,_ window:Double)->Bool {
+            guard health.online,!health.isStale,!health.partial,let at=health.observedAt else{return false}
+            let age=now.timeIntervalSince(at);return age.isFinite && age>=0 && age<=window
+        }
+        guard current(nativeHealth,30) else{return waiting("Observation Mac incomplète ou périmée")}
+        if nativeObservations.contains(where:{!$0.dashboard(entries:[],now:now).isDetectedActiveRender})
+            || (current(macHealth,30) && macJobs.contains{$0.proc != nil}) {
+            return .uncertain("Processus Mac candidat non attribué")
+        }
+        let required=softwareUpdateShadowWasConfigured || !config.shadowRunSources.isEmpty || !config.shadowFolders.isEmpty
+            || !shadowRuns.jobs.isEmpty || shadowPayload != nil || shadowDeclaration != nil || !shadowFolderEntries.isEmpty
+            || config.dashboardJobFolders.keys.contains{$0.hasPrefix("shadow:")}
+            || config.dashboardProjectLinks.keys.contains{$0.hasPrefix("shadow:")} || !config.remoteMirrors.isEmpty
+        if required {
+            guard current(shadowRuns.activityHealth,120) else{return waiting("Observation PC incomplète ou périmée")}
+            guard !shadowRuns.hasUnattributedCandidates,
+                  !(current(shadowHealth,45) && shadowTasks.contains{$0.state=="Running"}) else{
+                return .uncertain("Processus PC candidat non attribué")
+            }
+        } else {
+            guard case .confirmedUnconfigured(let checked)=softwareUpdateShadowScope else{return .uncertain("Périmètre PC non confirmé")}
+            let age=now.timeIntervalSince(checked)
+            guard age.isFinite,age>=0,age<=120 else{return .uncertain("Périmètre PC à revérifier")}
+        }
+        return .confirmed
+    }
+
+    // Read-only, live input for each updater decision. It never refreshes a source.
+    var softwareUpdateSafety:SoftwareUpdateSafety {softwareUpdateSafety(at:Date())}
+    var softwareUpdateSafetyReason:String {softwareUpdateSafetyAssessment(at:Date()).reason}
+    func softwareUpdateSafety(at now:Date) -> SoftwareUpdateSafety {
+        softwareUpdateSafetyAssessment(at:now).safety
+    }
+    func softwareUpdateSafetyAssessment(at now:Date) -> SoftwareUpdatePolicy.SafetyAssessment {
+        let nativeJobs=nativeObservations.map{$0.dashboard(entries:[],now:now)}
+        let shadowJobs=shadowRuns.jobs.filter{$0.isFresh && !$0.retainedHistorical}
+        func source(_ health:SourceHealth,active:Bool,candidate:Bool) -> SoftwareUpdatePolicy.SourceEvidence {
+            SoftwareUpdatePolicy.SourceEvidence(online:health.online,stale:health.isStale,partial:health.partial,
+                observedAt:health.observedAt,checkedAt:health.checkedAt,qualifiedActive:active,unattributedCandidate:candidate)
+        }
+        func recent(_ health:SourceHealth,window:Double) -> Bool {
+            guard health.online,!health.isStale,let observed=health.observedAt else{return false}
+            let age=now.timeIntervalSince(observed);return age.isFinite && age>=0 && age<=window
+        }
+        let legacyMacCandidate=recent(macHealth,window:30) && macJobs.contains{$0.proc != nil}
+        let legacyShadowCandidate=recent(shadowHealth,window:45) && shadowTasks.contains{$0.state=="Running"}
+        let native=source(nativeHealth,active:nativeJobs.contains(where: \.isDetectedActiveRender),
+            candidate:nativeJobs.contains{!$0.isDetectedActiveRender} || legacyMacCandidate)
+        let shadow=source(shadowRuns.health,active:shadowJobs.contains(where: \.isDetectedActiveRender),
+            candidate:shadowJobs.contains{$0.activity == .running && $0.taskQualification==nil} || shadowRuns.hasUnattributedCandidates || legacyShadowCandidate)
+        let refreshing=libraryBusy || nativeTask != nil || registryTask != nil || registryPending || folderBusy || folderPending
+            || macBusy || shadowBusy || shadowRemoteBusy || softwareUpdateShadowRequests>0 || declarationTask != nil
+        let converged=nativeRequestedGeneration>0 && nativeCompletedGeneration==nativeRequestedGeneration
+            && nativeCatalogueGeneration==nativeRequestedGeneration && softwareUpdateSnapshotGeneration==snapshotGeneration
+        let knownShadowScope=softwareUpdateShadowWasConfigured || !config.shadowRunSources.isEmpty || !config.shadowFolders.isEmpty
+            || !shadowRuns.jobs.isEmpty || shadowPayload != nil || shadowDeclaration != nil || !shadowFolderEntries.isEmpty
+            || config.dashboardJobFolders.keys.contains{$0.hasPrefix("shadow:")}
+            || config.dashboardProjectLinks.keys.contains{$0.hasPrefix("shadow:")} || !config.remoteMirrors.isEmpty
+        return SoftwareUpdatePolicy.assess(.init(monitoringEnabled:collectionEnabled,stopping:stopping,
+            configurationReadable:configurationWritable && configurationError==nil && softwareUpdateRegistryIsTrusted(at:now) && config.archivePayloadError==nil,
+            refreshing:refreshing,generationsConverged:converged,native:native,shadow:shadow,
+            shadowScope:knownShadowScope ? .required : softwareUpdateShadowScope),at:now)
+    }
+    // Existing native folder scopes do not imply that the optional legacy registry was used.
+    private var softwareUpdateHasRegistryContext:Bool {
+        func providerID(_ id:String)->Bool {
+            (id.hasPrefix("mac:") && !id.hasPrefix("mac:native:"))
+                || (id.hasPrefix("job:") && !id.hasPrefix("job:native:"))
+        }
+        return !registryFolders.isEmpty || !macJobs.isEmpty
+            || config.dashboardJobFolders.keys.contains(where:providerID)
+            || config.dashboardProjectLinks.keys.contains(where:providerID)
+            || config.jobContexts.keys.contains(where:providerID) || config.jobArchives.keys.contains(where:providerID)
+            || catalogSnapshot.jobs.contains{$0.source == .macMonitor && providerID($0.id)}
+    }
+    private func softwareUpdateRegistryIsTrusted(at now:Date)->Bool {
+        guard registryDiscoveryError==nil else{return false}
+        switch softwareUpdateRegistryAvailability {
+        case .available:return true
+        case .confirmedAbsent(let checked):
+            let age=now.timeIntervalSince(checked)
+            return !softwareUpdateHasRegistryContext && age.isFinite && age>=0 && age<=30
+        case .unavailable:return false
+        }
+    }
+    private func activityRegistryIsTrusted(at now:Date)->Bool {
+        guard activityRegistryError==nil else{return false}
+        switch activityRegistryAvailability {
+        case .available:return true
+        case .confirmedAbsent(let checked):
+            let age=now.timeIntervalSince(checked);return age.isFinite && age>=0 && age<=30
+        case .unavailable:return false
+        }
+    }
     private let nativeWorker: NativeRenderDiscovery
     @Published private(set) var nativeRequestedGeneration:UInt64=0
     @Published private(set) var nativeCompletedGeneration:UInt64=0
@@ -56,6 +260,9 @@ final class MonitorModel: ObservableObject {
     private var nativeHistoryObservations:[NativeRenderObservation]=[]
     private let registryURL: URL
     private var registryFolders: [String:String] = [:]
+    private var softwareUpdateRegistryAvailability:MacMonitorRegistryAvailability = .unavailable
+    private var activityRegistryAvailability:MacMonitorRegistryAvailability = .unavailable
+    private var activityRegistryError:String?
     private var registryTask: Task<Void,Never>?
     private var registryPending = false
     private var preferenceRevision: UInt64 = 0
@@ -95,10 +302,13 @@ final class MonitorModel: ObservableObject {
         MonitorModel(storageRoot:storageRoot,initialSnapshot:snapshot,collectionEnabled:false)
     }
 
-    init(storageRoot: URL? = nil, initialSnapshot: RenderCatalogSnapshot? = nil, collectionEnabled: Bool = true, previewLoader: RenderPreviewLoader? = nil, nativeReader: (any NativeProcessReading)? = nil, nativeIO:RenderBoundedIO? = nil) {
+    init(storageRoot: URL? = nil, initialSnapshot: RenderCatalogSnapshot? = nil, collectionEnabled: Bool = true, previewLoader: RenderPreviewLoader? = nil, nativeReader: (any NativeProcessReading)? = nil, nativeIO:RenderBoundedIO? = nil, shadowRunLoader:ShadowRunDiscovery.Loader? = nil, macOnly:Bool=false) {
         let selectedRoot = storageRoot ?? (collectionEnabled ? RenduStorage.root : FileManager.default.temporaryDirectory.appendingPathComponent("autoren-fixture-" + UUID().uuidString,isDirectory:true))
         if !collectionEnabled { precondition(selectedRoot.standardizedFileURL.path != RenduStorage.root.standardizedFileURL.path && !selectedRoot.standardizedFileURL.path.hasPrefix(RenduStorage.root.standardizedFileURL.path + "/"), "Fixture storage must be isolated") }
-        self.shadowRuns=ShadowRunDiscovery(root:selectedRoot)
+        let libraryEngine=ManagedRenderLibrary(lifetime:collectionLifetime)
+        self.managedLibrary=libraryEngine
+        self.libraryCoordinator=RenderLibraryCoordinator(engine:libraryEngine,lifetime:collectionLifetime)
+        self.shadowRuns=ShadowRunDiscovery(root:selectedRoot,loader:shadowRunLoader)
         self.storageRoot = selectedRoot; self.collectionEnabled = collectionEnabled
         self.registryURL = selectedRoot.appendingPathComponent("monitor-jobs.json")
         self.nativeWorker = NativeRenderDiscovery(reader:nativeReader ?? NativeProcessReader(),io:nativeIO ?? RenderBoundedIO())
@@ -119,6 +329,15 @@ final class MonitorModel: ObservableObject {
         case .loaded(let saved): config=saved
         case .unavailable(let message): configurationError=message; configurationWritable=false; config=AppConfig()
         }
+        if macOnly {
+            config.shadowMonitoringEnabled=false
+            if configurationWritable {
+                do {config=try preferences.update{$0.shadowMonitoringEnabled=false}}
+                catch {config.shadowMonitoringEnabled=false;configurationError="Surveillance Shadow coupée en mémoire · persistance non confirmée : \(error.localizedDescription)"}
+            }
+        }
+        CollectorProcess.setRemoteAccessEnabled(config.shadowMonitoringEnabled)
+        shadowRuns.setMonitoringEnabled(config.shadowMonitoringEnabled)
         if !collectionEnabled {
             if let seed=initialSnapshot {
                 for job in seed.jobs where config.jobContexts[job.id] == nil && job.workID != nil && job.sourceWorkID == nil {
@@ -127,6 +346,7 @@ final class MonitorModel: ObservableObject {
             }
             save(config,name:"config.json")
             catalogSnapshot = initialSnapshot ?? .empty; dashboardProjects = catalogSnapshot.projects
+            historyRevision=catalogSnapshot.historyRevision;lastCatalogHistoryRevision=catalogSnapshot.historyRevision;activeRenderJobs=catalogSnapshot.jobs.filter(\.isDetectedActiveRender)
             entries = catalogSnapshot.jobs.flatMap(\.previewEntries)
             return
         }
@@ -187,9 +407,11 @@ final class MonitorModel: ObservableObject {
     }
 
     func stop() {
+        observationRevision &+= 1
         stopping = true
         collectionLifetime.invalidate()
         previews.stop();shadowRuns.stop()
+        libraryTask?.cancel()
         snapshotTask?.cancel(); folderTask?.cancel(); declarationTask?.cancel(); registryTask?.cancel(); nativeTask?.cancel()
         timers.forEach { $0.invalidate() }
         timers.removeAll()
@@ -198,11 +420,11 @@ final class MonitorModel: ObservableObject {
     }
 
     func waitForShutdown() async {
-        let native=nativeTask
+        let native=nativeTask;let library=libraryTask
         let runs=shadowRuns
         let registry=registryTask;let snapshot=snapshotTask;let folders=folderTask;let declaration=declarationTask
         let finished=await RenderBoundedIO.wait(seconds:2) { [previews,remote] in
-            await native?.value
+            await native?.value;await library?.value
             await registry?.value;await snapshot?.value;await folders?.value
             await runs.waitForShutdown();await previews.waitForShutdown();await declaration?.value;await remote.waitForShutdown()
         }
@@ -339,7 +561,27 @@ final class MonitorModel: ObservableObject {
         RenderOrganization.isInside(path, root: root)
     }
 
+    var shadowMonitoringEnabled:Bool {config.shadowMonitoringEnabled}
+    @discardableResult func setShadowMonitoringEnabled(_ enabled:Bool)->Bool {
+        guard mutatePreferences({$0.shadowMonitoringEnabled=enabled}) else{return false}
+        CollectorProcess.setRemoteAccessEnabled(enabled);shadowRuns.setMonitoringEnabled(enabled)
+        shadowFolderRevision += 1;softwareUpdateScopeGeneration &+= 1
+        if !enabled {
+            declarationTask?.cancel();declarationTask=nil;libraryTask?.cancel()
+            remote.cancel()
+            session.getAllTasks{tasks in
+                for task in tasks where task.originalRequest?.url?.path.hasPrefix("/api/mac") != true {task.cancel()}
+            }
+            shadowHealth.online=false;shadowHealth.isStale=true;shadowHealth.message="Surveillance Shadow désactivée"
+            remoteHealth.online=false;remoteHealth.isStale=true;remoteHealth.message="Surveillance Shadow désactivée"
+            softwareUpdateShadowScope = .uncertain
+            previews.setVisiblePreviewEntries(entries.filter{!$0.source.isShadow},roots:[])
+        } else if collectionEnabled {Task{await refreshShadow();await refreshShadowFolders()}}
+        combine();return true
+    }
+
     private func fetch(_ path: String) async throws -> Data {
+        guard config.shadowMonitoringEnabled || path.hasPrefix("api/mac") else{throw URLError(.cancelled)}
         var request = URLRequest(url: base.appendingPathComponent(path))
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let (data, response) = try await session.data(for: request)
@@ -350,7 +592,7 @@ final class MonitorModel: ObservableObject {
     }
 
     func refreshShadow() async {
-        guard collectionEnabled, !stopping else { return }
+        guard config.shadowMonitoringEnabled,collectionEnabled, !stopping else { return }
         guard !shadowBusy else { return }
         shadowBusy = true
         defer { shadowBusy = false }
@@ -368,7 +610,7 @@ final class MonitorModel: ObservableObject {
             let now = Date()
             save(CachedPayload(data: data, at: now), name: "shadow-last-good.json")
             if shadowDeclaration?.matches(response) != true { shadowDeclaration=nil }
-            guard !Task.isCancelled, !stopping else { return }
+            guard config.shadowMonitoringEnabled,!Task.isCancelled, !stopping else { return }
             adoptShadow(response, at: now, live: true)
             refreshDeclarationInBackground(response)
 
@@ -383,13 +625,14 @@ final class MonitorModel: ObservableObject {
     }
 
     private func refreshDeclarationInBackground(_ response:ShadowResponse) {
+        guard config.shadowMonitoringEnabled else{return}
         let identity=response.tasks?.map(\.name).sorted().joined(separator:"|") ?? "unknown"
         if declarationIdentity != identity { declarationTask?.cancel();declarationTask=nil;lastDeclarationAttempt=nil;declarationIdentity=identity }
         guard declarationTask == nil, lastDeclarationAttempt.map({ Date().timeIntervalSince($0)>=300 }) ?? true else { return }
         lastDeclarationAttempt=Date()
         declarationTask=Task {
             defer { if declarationIdentity==identity { declarationTask=nil } }
-            guard let page=try? await fetch(""),!Task.isCancelled,!stopping,declarationIdentity==identity,
+            guard let page=try? await fetch(""),config.shadowMonitoringEnabled,!Task.isCancelled,!stopping,declarationIdentity==identity,
                   let current=shadowPayload,let declared=ShadowDashboardDeclaration.parse(page,sourceURL:base.absoluteString,checkedAt:Date()),declared.matches(current) else { return }
             shadowDeclaration=declared;save(declared,name:"shadow-dashboard-declaration.json");combine()
         }
@@ -490,7 +733,7 @@ final class MonitorModel: ObservableObject {
     }
 
     func refreshShadowFolders() async {
-        guard collectionEnabled, !stopping else { return }
+        guard config.shadowMonitoringEnabled,collectionEnabled, !stopping else { return }
         defer {if !stopping {Task {await self.refreshShadowRunDiscovery()}}}
         guard !shadowRemoteBusy else { return }
         guard !config.shadowFolders.isEmpty else {
@@ -526,8 +769,27 @@ final class MonitorModel: ObservableObject {
     }
 
     func refreshShadowRunDiscovery(force:Bool=false) async {
-        guard collectionEnabled,!stopping else{return}
-        guard await shadowRuns.hasConfiguredConnection() else{return}
+        guard config.shadowMonitoringEnabled,collectionEnabled,!stopping else{return}
+        observationRevision &+= 1
+        softwareUpdateShadowRequests += 1
+        softwareUpdateScopeGeneration &+= 1
+        let ticket=softwareUpdateScopeGeneration;let revision=preferenceRevision
+        softwareUpdateShadowScope = .uncertain
+        defer { softwareUpdateShadowRequests -= 1;observationRevision &+= 1 }
+        let connected=await shadowRuns.hasConfiguredConnection()
+        guard !stopping,!Task.isCancelled,ticket==softwareUpdateScopeGeneration,revision==preferenceRevision else{return}
+        if connected {
+            softwareUpdateShadowWasConfigured=true
+            softwareUpdateShadowScope = .required
+        } else {
+            let scope:SoftwareUpdatePolicy.ShadowScope
+            if softwareUpdateShadowWasConfigured {scope = .required}
+            else {scope=await shadowRuns.softwareUpdateLocalScope()}
+            guard !stopping,!Task.isCancelled,ticket==softwareUpdateScopeGeneration,revision==preferenceRevision else{return}
+            if case .required = scope {softwareUpdateShadowWasConfigured=true}
+            softwareUpdateShadowScope=scope
+            return
+        }
         await shadowRuns.refresh(config.shadowRunSources,force:force)
     }
 
@@ -539,7 +801,22 @@ final class MonitorModel: ObservableObject {
         rebuildSnapshot()
     }
 
-    func setVisiblePreviewEntries(_ entries:[RenderEntry]) { previews.setVisiblePreviewEntries(entries,roots:config.shadowFolders+shadowRuns.allowedRoots) }
+    func setVisiblePreviewEntries(_ entries:[RenderEntry]) { previews.setVisiblePreviewEntries(entries.filter{config.shadowMonitoringEnabled || !$0.source.isShadow},roots:config.shadowMonitoringEnabled ? config.shadowFolders+shadowRuns.allowedRoots:[]) }
+    func setCompactPreviewVisibility(_ visible:Bool) {
+        guard compactPreviewVisible != visible else{return}
+        compactPreviewVisible=visible
+        if visible {previews.reconcileVisiblePreviews(catalogSnapshot)}
+        previews.setCompactPreviewsVisible(visible)
+    }
+    func setCompactPreviewsVisible(_ visible:Bool){setCompactPreviewVisibility(visible)}
+    func setCompactPreview(_ entry:RenderEntry?,forJobID jobID:String) {
+        let valid=entry.flatMap {value -> RenderEntry? in
+            guard value.source == .macFolder,value.monitorJobID==jobID,
+                  catalogSnapshot.jobs.first(where:{$0.id==jobID})?.previewEntries.contains(value)==true else{return nil}
+            return value
+        }
+        previews.setCompactPreview(valid,forJobID:jobID)
+    }
     func retryVisiblePreviews() { previews.retryVisiblePreviews() }
     func previewStatus(for entry:RenderEntry)->RenderPreviewStatus {previews.status(for:entry)}
     func thumbnail(for entry:RenderEntry)->NSImage? {previews.thumbnail(for:entry)}
@@ -590,20 +867,51 @@ final class MonitorModel: ObservableObject {
             folderHealth:folderHealth,remoteHealth:remoteHealth)
         input.nativeObservations = nativeObservations
         input.nativeHistoryObservations=nativeHistoryObservations
-        input.shadowRunJobs = shadowRuns.jobs
+        input.shadowRunJobs = shadowRuns.jobs.map { original in
+            var job=original
+            if !config.shadowMonitoringEnabled {job.isFresh=false;job.retainedHistorical=true;job.taskQualification=nil}
+            return job
+        }
         if !collectionEnabled { input.preparedJobs = catalogSnapshot.jobs }
         let nativeGeneration=nativeCompletedGeneration
         snapshotTask = Task {
             guard let prepared = await catalogue.build(input), !Task.isCancelled, !stopping, generation == snapshotGeneration else { return }
             catalogSnapshot = prepared; dashboardProjects = prepared.projects
+            if lastCatalogHistoryRevision != prepared.historyRevision {lastCatalogHistoryRevision=prepared.historyRevision;historyRevision &+= 1}
+            activeRenderJobs=prepared.jobs.filter(\.isDetectedActiveRender)
+            softwareUpdateSnapshotGeneration=generation
+            observationRevision &+= 1
             previews.reconcileVisiblePreviews(prepared)
             nativeCatalogueGeneration=max(nativeCatalogueGeneration,nativeGeneration)
+            scheduleLibraryCycle(prepared.libraryJobs)
             if !prepared.reactivatedArchiveIDs.isEmpty {
                 _ = updateJobArchives(prepared.reactivatedArchiveIDs,archived:false)
             }
         }
     }
 
+    private func scheduleLibraryPolicy(_ settings:RenderLibrarySettings) {
+        guard config.shadowMonitoringEnabled,collectionEnabled,!stopping,!libraryBusy,libraryTask==nil else{return}
+        libraryBusy=true
+        libraryTask=Task { [weak self] in
+            guard let self else{return};defer{libraryBusy=false;libraryTask=nil}
+            guard await shadowRuns.hasConfiguredConnection(),!stopping,!Task.isCancelled else{return}
+            do{try await libraryCoordinator.configurePolicy(settings:settings)}
+            catch{if !stopping {libraryError="Politique PC non confirmée · ancien bail limité à120s"}}
+        }
+    }
+    private func scheduleLibraryCycle(_ jobs:[RenderDashboardJob]) {
+        guard collectionEnabled,!stopping,!libraryBusy,libraryTask==nil,librarySettings.mode == .managedLibrary else{return}
+        let settings=librarySettings,contextConfig=config,remoteExpected=softwareUpdateShadowWasConfigured || shadowRuns.activityHealth.online;libraryBusy=true
+        libraryTask=Task { [weak self] in
+            guard let self else{return}
+            defer{self.libraryBusy=false;self.libraryTask=nil}
+            let result=await libraryCoordinator.cycle(jobs:jobs,settings:settings,contextConfig:contextConfig,remoteConnectionExpected:remoteExpected,remoteMonitoringEnabled:contextConfig.shadowMonitoringEnabled)
+            guard !stopping,!Task.isCancelled,settings==librarySettings else{return}
+            libraryRecords=result.records;libraryActivities=result.activities
+            if result.changed {historyRevision &+= 1}
+        }
+    }
     private func historyRequestIsCurrent(_ request:UInt64, folder:UInt64, shadow:Int) -> Bool {
         !stopping && historyRequestGeneration == request && folderRevision == folder && shadowFolderRevision == shadow
     }
@@ -641,7 +949,7 @@ final class MonitorModel: ObservableObject {
         if cursor == nil && !roots.isEmpty && !job.source.isShadow {
             let result = await folderWorker.history(roots)
             incoming = result.entries; coverage = result.health.online ? (result.health.partial ? "Inventaire partiel des dossiers liés" : "Inventaire du scope demandé") : "Dossier indisponible · métadonnées conservées"
-        } else if cursor == nil && job.source.isShadow {
+        } else if cursor == nil && job.source.isShadow && config.shadowMonitoringEnabled {
             if !roots.isEmpty {
                 if let result = await remote.history(roots) { incoming = result.entries; coverage = result.coverage }
                 else { coverage = "Shadow indisponible · métadonnées conservées" }
@@ -669,6 +977,7 @@ final class MonitorModel: ObservableObject {
 
     private func mutatePreferences(_ body:(inout AppConfig)->Void) -> Bool {
         guard configurationWritable else { return false }
+        defer {observationRevision &+= 1}
         do { config=try preferences.update(body);preferenceRevision &+= 1;configurationError=nil;return true }
         catch { configurationError=error.localizedDescription;return false }
     }
@@ -677,12 +986,20 @@ final class MonitorModel: ObservableObject {
     private func refreshMacRegistry() {
         guard collectionEnabled, !stopping else { return }
         if registryTask != nil { registryPending = true; return }
+        observationRevision &+= 1
         let revision = preferenceRevision
         registryTask = Task {
+            defer {observationRevision &+= 1}
             let result = await registryWorker.reconcile(registry:registryURL, store:preferences,
                                                         writable:configurationWritable)
             guard !Task.isCancelled, !stopping else { registryTask = nil; return }
             registryDiscoveryError = result.issue
+            activityRegistryAvailability=result.availability;activityRegistryError=result.issue
+            softwareUpdateRegistryAvailability = result.availability
+            if case .confirmedAbsent = result.availability,softwareUpdateHasRegistryContext {
+                registryDiscoveryError="Registre Mac attendu absent · associations conservées"
+                softwareUpdateRegistryAvailability = .unavailable
+            }
             if let folders = result.folders { registryFolders = folders }
             if let updated = result.config {
                 if revision == preferenceRevision {
@@ -749,6 +1066,7 @@ final class MonitorModel: ObservableObject {
     @discardableResult
     private func refreshNativeRenders() -> UInt64 {
         guard collectionEnabled,!stopping else { return nativeRequestedGeneration }
+        observationRevision &+= 1
         nativeRequestedGeneration &+= 1
         if nativeTask==nil { launchNativeRenders() }
         return nativeRequestedGeneration
@@ -759,8 +1077,10 @@ final class MonitorModel: ObservableObject {
         let ticket=nativeRequestedGeneration
         let revision=preferenceRevision
         let links=config.dashboardJobFolders
+        let historicalJobs=Array(catalogSnapshot.jobs.filter{$0.id.hasPrefix("mac:native:")}.prefix(64))
         nativeTask=Task {
-            let result=await nativeWorker.collect(store:preferences,links:links,writable:configurationWritable)
+            defer {observationRevision &+= 1}
+            let result=await nativeWorker.collect(store:preferences,links:links,writable:configurationWritable,historicalJobs:historicalJobs)
             guard !Task.isCancelled,!stopping else { nativeTask=nil;return }
             nativeHealth=result.health;nativeObservations=result.observations;nativeHistoryObservations=result.historyObservations
             var preferencesAdopted=true
