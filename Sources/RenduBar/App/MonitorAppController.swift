@@ -193,6 +193,13 @@ final class RenduAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate
             syncCompactPreviewVisibility(excluding: window)
         }
     }
+    func windowDidResignKey(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === compactWindow else { return }
+        emitWindowFrame(.focusChange, window: window)
+    }
+    func applicationDidResignActive(_ notification: Notification) {
+        if let compactWindow, compactWindow.isVisible { emitWindowFrame(.focusChange, window: compactWindow) }
+    }
     func windowDidMiniaturize(_ notification: Notification) { syncCompactPreviewVisibility() }
     func windowDidDeminiaturize(_ notification: Notification) { syncCompactPreviewVisibility() }
     func popoverDidShow(_ notification: Notification) { syncCompactPreviewVisibility() }
@@ -210,12 +217,15 @@ final class RenduAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate
         else { return }
         windowFrameDiagnostic.record(kind: kind, action: action, frame: window.frame,
             isVisible: window.isVisible, isMiniaturized: window.isMiniaturized,
+            level: window.level.rawValue, hidesOnDeactivate: window.hidesOnDeactivate,
+            isKey: window.isKeyWindow, appActive: NSApp.isActive,
             at: ProcessInfo.processInfo.systemUptime)
     }
 
     @objc private func applicationBecameActive(_ notification: Notification) {
         loginItems.refresh()
         updateStatus()
+        if let compactWindow, compactWindow.isVisible { emitWindowFrame(.focusChange, window: compactWindow) }
     }
 
     @objc private func screenParametersChanged(_ notification: Notification) {
@@ -259,6 +269,9 @@ final class RenduAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate
         if let compactWindow { return compactWindow }
         let window = makeWindow(title: "AUTORENDER — Suivi compact", size: NSSize(width: 520, height: 640),
                                 minimum: NSSize(width: 480, height: 340), key: "AUTORENDER.Compact")
+        window.level = .floating
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.contentViewController = RenderHostingController(rootView: summary(detached: true))
         restoreGeometry(window, key: "AUTORENDER.Compact")
         compactWindow = window
@@ -277,22 +290,14 @@ final class RenduAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     @objc private func togglePopover() {
-        if let compactWindow {
-            if compactWindow.isVisible && !compactWindow.isMiniaturized {
-                compactWindow.orderOut(nil)
-                emitWindowFrame(.hide, window: compactWindow)
-                syncCompactPreviewVisibility()
-            } else {
-                reveal(compactWindow)
-            }
-            return
-        }
-        guard let button = statusItem?.button else { return }
-        if popover.isShown { popover.performClose(nil) }
-        else {
+        let window = prepareCompact()
+        if window.isVisible && !window.isMiniaturized {
+            window.orderOut(nil)
+            emitWindowFrame(.hide, window: window)
+            syncCompactPreviewVisibility()
+        } else {
             loginItems.refresh()
-            popover.contentViewController = RenderHostingController(rootView: summary(detached: false))
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            reveal(window)
         }
     }
 

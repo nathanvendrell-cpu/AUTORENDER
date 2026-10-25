@@ -45,3 +45,9 @@ Le démarrage `--mac-only` désactive le suivi PC avant la collecte et conserve 
 La cadence moyenne utilise seulement les durées valides du reçu lié au job courant ; les durées héritées sont exclues et les absences restent indéterminées. La vignette correspond au dernier PNG terminé, lié au même job et vérifié par empreinte, taille et identité du fichier. Son décodage est limité à 420 pixels ; les demandes du compact masqué sont retirées tout en conservant celles du détail. Le second clic sur la barre masque la fenêtre détachée ; le suivant réutilise cette fenêtre et sa géométrie.
 
 La commande `python3 -B Scripts/test-context-library.py --timing` exécute les fixtures de cadence, de PNG et de visibilité. Les interactions et la géométrie natives doivent être contrôlées séparément.
+
+## Compact persistant 0.9.3
+
+Le premier clic sur la barre ouvre une fenêtre compacte persistante. Elle utilise le niveau flottant et reste affichée lorsque AUTORENDER perd le focus. Le clic suivant la masque ; une nouvelle ouverture réutilise la même instance et ses réglages de géométrie. La vue générale conserve son niveau normal. Les interactions avec les autres applications et les espaces macOS demandent une observation native séparée.
+
+`python3 -B Scripts/test-window-diagnostic.py` compile trois fichiers dans un dossier temporaire et teste la sérialisation des événements de fenêtre, du niveau, de la visibilité et du focus, ainsi que les limites de collecte. Ce test utilise uniquement des rectangles et états synthétiques : il ne crée aucune fenêtre et ne prouve pas le maintien réel au premier plan. Les typechecks, le build et la validation native restent des preuves distinctes.
